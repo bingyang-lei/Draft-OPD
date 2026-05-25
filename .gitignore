@@ -1,0 +1,20 @@
+# Publish only the two code repositories from this workspace.
+/*
+!/.gitignore
+!/verl/
+!/sglang-dflash/
+
+# Ignore top-level workspace scripts; child repository files are unaffected.
+/*.py
+/install.sh
+/.nested-git-backups/
+
+# In the OPD trainer examples, publish only the two reusable entrypoints.
+/verl/examples/on_policy_distillation_trainer/*
+!/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh
+!/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
+
+# Local experiment notes and one-off conversion wrappers contain machine paths.
+/verl/change-by-codex.md
+/verl/my-purpose.md
+/verl/scripts/fsdp_to_dflash.sh

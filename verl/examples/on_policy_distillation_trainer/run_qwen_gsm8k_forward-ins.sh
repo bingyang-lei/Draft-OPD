@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "$REPO_ROOT"
+
+DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k3}
+REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT:-0.0}
+FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT:-1.0}
+REJECTED_DRAFT_USE_REVERSE_KL=${REJECTED_DRAFT_USE_REVERSE_KL:-True}
+LR=${LR:-3e-4}
+TEST_FREQ=${TEST_FREQ:-250}
+SAVE_FREQ=${SAVE_FREQ:-500}
+SAVE_START_STEP=${SAVE_START_STEP:-5000}
+STUDENT_WORLD_SIZE=${STUDENT_WORLD_SIZE:-7}
+TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-1}
+TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-21}
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+MAX_PROMPT=${MAX_PROMPT:-512}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
+STUDENT_MAX_TOKEN_LEN_PER_GPU=$(( PPO_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT + MAX_RESPONSE_LENGTH) ))
+ROLLOUT_AGENT_NUM_WORKERS=${ROLLOUT_AGENT_NUM_WORKERS:-$STUDENT_WORLD_SIZE}
+ROLLOUT_SPEED_TEST_WORKER_COUNT=${ROLLOUT_SPEED_TEST_WORKER_COUNT:-$STUDENT_WORLD_SIZE}
+ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK=${ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK:-$(( ROLLOUT_SPEED_TEST_WORKER_COUNT * 2 ))}
+train_epochs=${train_epochs:-7}
+stream_weight=${stream_weight:-1.0}
+rejected_draft_stream_weight=${rejected_draft_stream_weight:-1.0}
+REJECTED_DRAFT_POSITION_DECAY_ENABLED=${REJECTED_DRAFT_POSITION_DECAY_ENABLED:-True}
+REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
+RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
+RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
+DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
+TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.1}
+ENABLE_THINKING=${ENABLE_THINKING:-False}
+DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your draft model path.
+TRAIN_JSONL=${TRAIN_JSONL:-""} # your data path.
+TRAIN_JSONL_FILENAME="$(basename "$TRAIN_JSONL")"
+TRAIN_JSONL_NAME="${TRAIN_JSONL_FILENAME%.jsonl}"
+TRAIN_FILES="['$TRAIN_JSONL']"
+TODAY=$(date +"%m-%d")
+EXP_NAME=${EXP_NAME:-"ins-lr-${LR}-random_anchor-${RANDOM_RESPONSE_ANCHOR_ENABLED}/student-teacher-${TODAY}/${DISTILLATION_LOSS_MODE}/enable-thinking-${ENABLE_THINKING}/train-${TRAIN_JSONL_NAME}-update-accumulation-steps"}
+CKPT_DIR=${CKPT_DIR:-"checkpoints/verl-dflash-opd/${EXP_NAME}"}
+
+exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
+    data.train_files="${TRAIN_FILES}" \
+    data.max_prompt_length="${MAX_PROMPT}" \
+    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
+    data.train_batch_size="${TRAIN_PROMPT_BSZ}" \
+    +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_draft_model_path="${DRAFT_MODEL_PATH}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_lm_head_chunk_size="${DFLASH_LM_HEAD_CHUNK_SIZE}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
+    actor_rollout_ref.rollout.max_model_len="${MAX_NUM_TOKENS}" \
+    actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_NUM_TOKENS}" \
+    actor_rollout_ref.rollout.agent.num_workers="${ROLLOUT_AGENT_NUM_WORKERS}" \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.speculative_draft_model_path="${DRAFT_MODEL_PATH}" \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.mem_fraction_static="${TEACHER_GPU_MEMORY_UTILIZATION}" \
+    distillation.n_gpus_per_node="${TEACHER_WORLD_SIZE}" \
+    distillation.teacher_models.teacher_model.inference.max_model_len="${MAX_NUM_TOKENS}" \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${MAX_NUM_TOKENS}" \
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization="${TEACHER_GPU_MEMORY_UTILIZATION}" \
+    distillation.distillation_loss.loss_mode="${DISTILLATION_LOSS_MODE}" \
+    distillation.distillation_loss.reverse_kl_weight="${REVERSE_KL_WEIGHT}" \
+    distillation.distillation_loss.forward_kl_weight="${FORWARD_KL_WEIGHT}" \
+    distillation.distillation_loss.rejected_draft_use_reverse_kl="${REJECTED_DRAFT_USE_REVERSE_KL}" \
+    distillation.distillation_loss.response_stream_weight="${stream_weight}" \
+    distillation.distillation_loss.rejected_draft_stream_weight="${rejected_draft_stream_weight}" \
+    distillation.distillation_loss.rejected_draft_position_decay_enabled="${REJECTED_DRAFT_POSITION_DECAY_ENABLED}" \
+    distillation.distillation_loss.rejected_draft_position_decay="${REJECTED_DRAFT_POSITION_DECAY}" \
+    actor_rollout_ref.actor.optim.lr="${LR}" \
+    trainer.test_freq="${TEST_FREQ}" \
+    trainer.save_freq="${SAVE_FREQ}" \
+    trainer.save_start_step="${SAVE_START_STEP}" \
+    trainer.n_gpus_per_node="${STUDENT_WORLD_SIZE}" \
+    trainer.rollout_speed_test_worker_count="${ROLLOUT_SPEED_TEST_WORKER_COUNT}" \
+    trainer.rollout_speed_test_max_samples_per_benchmark="${ROLLOUT_SPEED_TEST_MAX_SAMPLES_PER_BENCHMARK}" \
+    trainer.total_epochs="${train_epochs}" \
+    trainer.experiment_name="${EXP_NAME}" \
+    trainer.default_local_dir="${CKPT_DIR}" \
+    "$@"
