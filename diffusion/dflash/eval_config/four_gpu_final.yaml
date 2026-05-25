@@ -1,0 +1,28 @@
+vars:
+  output_dir: sglang-logs-final/4-gpu
+  # Fill these with local model paths before running.
+  target_model: "" # your target model path.
+
+jobs:
+  - name: gpu0
+    gpu: 0
+    target_model: ${target_model}
+    draft_model: ../../verl/checkpoints/verl-dflash-opd/YOUR_RUN/global_step_3000/draft_model
+    output_md: ${output_dir}/gpu0.md
+    dataset_name: &eval_datasets ["gsm8k:128", "aime24:30", "aime25:30", "math500:128", "mbpp:128", "humaneval:128", "mt-bench:80", "mgsm_zh:32", "swe-bench:128", "alpaca:128", "aime26:30"]
+    concurrency_num: 1
+    add_base: false
+    enable_think: true
+    attention_backends: fa3
+    max_new_tokens: 8192
+
+  - name: gpu1
+    gpu: 1
+    target_model: ${target_model}
+    draft_model: ../../verl/checkpoints/verl-dflash-opd/YOUR_RUN/global_step_3500/draft_model
+    output_md: ${output_dir}/gpu1.md
+    dataset_name: *eval_datasets
+    concurrency_num: "1"
+    enable_think: true
+    attention_backends: fa3
+    max_new_tokens: 8192

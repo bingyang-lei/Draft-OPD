@@ -1,0 +1,30 @@
+**/logs/
+
+# Local repos and generated artifacts
+/mini-sglang/
+/EAGLE/
+/AI-Research-SKILLs/
+/dflash-new/
+/gpt-oss/
+/entropy-eval/
+/logs/
+/transformer-bench/
+
+# Generated files
+*.log
+*.jsonl
+*.ipynb
+*.md
+!README.md
+!**/README.md
+__pycache__/
+*.pyc
+/download-dataset.py
+/get_test_jsonl.py
+
+# Nested dflash outputs and local benchmark helpers
+/dflash/wandb/
+/dflash/benchmark-variant/
+/dflash/results/
+/dflash/benchmark_per_part_time.py
+/dflash/run-bench-per-part-time.sh

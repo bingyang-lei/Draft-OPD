@@ -1,0 +1,30 @@
+# Example config for:
+#   bash sglang_run_bench.sh --config-yaml eval_config/two_gpu_example.yaml
+#
+# Each item under jobs is launched as an independent benchmark process.
+# The launcher sets CUDA_VISIBLE_DEVICES to the job's gpu value.
+# If draft_model is omitted/null/empty, the job runs baseline only.
+
+jobs:
+  - name: gpu0
+    gpu: 0
+    target_model: "" # your target model path.
+    draft_model: "" # your draft model path.
+    output_md: sglang-logs-final/gpu0.md
+    dataset_name: ["aime24:30", "math500:128", "gsm8k:128", "mbpp:128", "humaneval:128", "aime25:30", "alpaca:128", "mt-bench:80", "mgsm_zh:32", "swe-bench:128"]
+    concurrency_num: 1
+    add_base: false
+    enable_think: true
+    attention_backends: fa3
+    max_new_tokens: 8192
+
+  - name: gpu1
+    gpu: 1
+    target_model: "" # your target model path.
+    draft_model: ../../verl/checkpoints/verl-dflash-opd/YOUR_RUN/global_step_xxxx/draft_model
+    output_md: sglang-logs-final/gpu1.md
+    dataset_name: ["aime24:30", "math500:128", "gsm8k:128", "mbpp:128", "humaneval:128", "aime25:30", "alpaca:128", "mt-bench:80", "mgsm_zh:32", "swe-bench:128"]
+    concurrency_num: "1"
+    enable_think: true
+    attention_backends: fa3
+    max_new_tokens: 8192

@@ -1,0 +1,25 @@
+.vscode
+.DS_Store
+__pycache__
+**/*.pyc
+
+data*/
+jobs/
+wandb/
+logs/
+
+# Generated benchmark artifacts
+benchmark-variant/
+results/
+*.log
+*.jsonl
+*.md
+!README.md
+!**/README.md
+
+# Local benchmark helpers
+benchmark_per_part_time.py
+run-bench-per-part-time.sh
+
+!USAGE.md
+!USAGE_CN.md

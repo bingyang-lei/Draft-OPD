@@ -1,8 +1,10 @@
 # Publish only the two code repositories from this workspace.
 /*
 !/.gitignore
+!/README.md
 !/verl/
 !/sglang-dflash/
+!/diffusion/
 
 # Ignore top-level workspace scripts; child repository files are unaffected.
 /*.py
@@ -17,4 +19,4 @@
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md
 /verl/my-purpose.md
-/verl/scripts/fsdp_to_dflash.sh
+/verl/scripts/fsdp_to_eagle3.sh
