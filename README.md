@@ -8,6 +8,16 @@ verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
 
 The script launches DFlash on-policy distillation through `verl`. It wraps `run_qwen_gsm8k.sh`, so run it from the repository root after installing the `verl` training environment.
 
+## Install
+
+From the repository root, run:
+
+```bash
+bash install.sh
+```
+
+This installs the editable `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
+
 ## Quick Start
 
 Set your local model and data paths, then run:
