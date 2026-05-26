@@ -8,7 +8,7 @@
 
 # Ignore top-level workspace scripts; child repository files are unaffected.
 /*.py
-/install.sh
+/install-local.sh
 /.nested-git-backups/
 
 # In the OPD trainer examples, publish only the two reusable entrypoints.
