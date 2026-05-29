@@ -75,6 +75,8 @@ See [diffusion/dflash/README.md](diffusion/dflash/README.md) for the DFlash eval
 
 ## 📚 Citation
 
+If you find our work useful, please consider citing our paper:
+
 ```bibtex
 @misc{lei2026draftopdonpolicydistillationspeculative,
       title={Draft-OPD: On-Policy Distillation for Speculative Draft Models}, 
