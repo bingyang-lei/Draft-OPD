@@ -73,4 +73,16 @@ Draft-OPD evaluation utilities live under `diffusion/`, with the main benchmark 
 
 See [diffusion/dflash/README.md](diffusion/dflash/README.md) for the DFlash evaluation entrypoints and links to the English / Chinese usage guides.
 
+## 📚 Citation
 
+```bibtex
+@misc{lei2026draftopdonpolicydistillationspeculative,
+      title={Draft-OPD: On-Policy Distillation for Speculative Draft Models}, 
+      author={Haodi Lei and Yafy Li and Haoran Zhang and Shunkai Zhang and Qianjia Cheng and Xiaoye Qu and Ganqu Cui and Bowen Zhou and Ning Ding and Yun Luo and Yu Cheng},
+      year={2026},
+      eprint={2605.29343},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2605.29343}, 
+}
+```
