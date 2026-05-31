@@ -1,4 +1,44 @@
-# OPD DFlash Training
+# Draft-OPD: On-Policy Distillation for Speculative Draft Models
+
+<p align="center">
+  <img src="fig/overview-draft-opd.jpg" alt="Draft-OPD overview" width="92%">
+</p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.29343"><img src="https://img.shields.io/badge/arXiv-2605.29343-b31b1b.svg" alt="arXiv"></a>
+  <a href="https://huggingface.co/collections/bingyang-lei/draft-opd"><img src="https://img.shields.io/badge/Hugging%20Face-Models-yellow.svg" alt="Hugging Face models"></a>
+  <a href="https://github.com/bingyang-lei/Draft-OPD"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project page"></a>
+</p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2605.29343">Paper</a> |
+  <a href="https://huggingface.co/collections/bingyang-lei/draft-opd">Models</a> |
+  <a href="https://github.com/bingyang-lei/Draft-OPD">Project Page</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#evaluation">Evaluation</a> |
+  <a href="#citation">Citation</a>
+</p>
+
+## News
+
+- [May 2026] Draft-OPD is available on arXiv: [2605.29343](https://arxiv.org/abs/2605.29343).
+- [May 2026] Released Draft-OPD model checkpoints are available in the [Hugging Face collection](https://huggingface.co/collections/bingyang-lei/draft-opd).
+
+## Introduction
+
+Draft-OPD trains speculative draft models with on-policy target feedback. Instead of only learning from fixed target-generated trajectories, the drafter is supervised on draft-induced states exposed during speculative verification, including the positions where draft proposals are rejected.
+
+This repository contains the public training and evaluation code for Draft-OPD. The main training stack is built on `verl` and `sglang-dflash`, while the evaluation utilities live under `diffusion/`.
+
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `verl/` | Training code and the public OPD DFlash training entrypoint. |
+| `sglang-dflash/` | DFlash / SGLang runtime code used by training and evaluation. |
+| `diffusion/` | Draft-OPD evaluation utilities, with the main benchmark workflow in `diffusion/dflash/`. |
+
+## Training Entry Point
 
 This repository provides a single public training entrypoint:
 
@@ -73,7 +113,7 @@ Draft-OPD evaluation utilities live under `diffusion/`, with the main benchmark 
 
 See [diffusion/dflash/README.md](diffusion/dflash/README.md) for the DFlash evaluation entrypoints and links to the English / Chinese usage guides.
 
-## 📚 Citation
+## Citation
 
 If you find our work useful, please consider citing our paper:
 

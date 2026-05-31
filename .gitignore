@@ -1,4 +1,4 @@
-# Publish only the two code repositories from this workspace.
+# Publish only the selected public repository content from this workspace.
 /*
 !/.gitignore
 !/README.md
@@ -6,6 +6,9 @@
 !/verl/
 !/sglang-dflash/
 !/diffusion/
+!/fig/
+/fig/*
+!/fig/overview-draft-opd.jpg
 
 # Ignore top-level workspace scripts; child repository files are unaffected.
 /*.py
