@@ -24,3 +24,5 @@
 /verl/change-by-codex.md
 /verl/my-purpose.md
 /verl/scripts/fsdp_to_eagle3.sh
+/verl/scripts/extract_eagle3_draft_from_fsdp.py
+/verl/verl/models/transformers/eagle3_student.py

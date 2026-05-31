@@ -16,6 +16,7 @@
   <a href="https://github.com/bingyang-lei/Draft-OPD">Project Page</a> |
   <a href="#quick-start">Quick Start</a> |
   <a href="#evaluation">Evaluation</a> |
+  <a href="#acknowledgements">Acknowledgements</a> |
   <a href="#citation">Citation</a>
 </p>
 
@@ -75,7 +76,7 @@ bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh 
 Required paths:
 
 - `MAIN_MODEL_PATH`: target/main model. For example, use [`Qwen/Qwen3-4B`](https://huggingface.co/Qwen/Qwen3-4B).
-- `DRAFT_MODEL_PATH`: initialized draft model used for speculative decoding and training. For example, download [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) from Hugging Face.
+- `DRAFT_MODEL_PATH`: initialized draft model used for speculative decoding and training. For example, download [`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16) from Hugging Face. Alternatively, you can train your own draft model with [SpecForge](https://github.com/sgl-project/SpecForge).
 - `TRAIN_JSONL`: training data in JSONL format.
 - `data.val_files`: validation JSONL files, passed as a Hydra override.
 
@@ -107,11 +108,17 @@ Checkpoints are saved under:
 verl/checkpoints/verl-dflash-opd/
 ```
 
+Use `verl/scripts/fsdp_to_dflash.sh` from the repository root to extract the draft model from saved actor weights.
+
 ## Evaluation
 
 Draft-OPD evaluation utilities live under `diffusion/`, with the main benchmark workflow in `diffusion/dflash/`.
 
 See [diffusion/dflash/README.md](diffusion/dflash/README.md) for the DFlash evaluation entrypoints and links to the English / Chinese usage guides.
+
+## Acknowledgements
+
+We thank the DFlash and EAGLE3 projects for their inspiring work on speculative decoding and draft-model training. We also thank [SpecForge](https://github.com/sgl-project/SpecForge), SGLang, and verl for the open-source infrastructure that this repository builds on.
 
 ## Citation
 
