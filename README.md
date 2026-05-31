@@ -114,11 +114,13 @@ Use `verl/scripts/fsdp_to_dflash.sh` from the repository root to extract the dra
 
 Draft-OPD evaluation utilities live under `diffusion/`, with the main benchmark workflow in `diffusion/dflash/`.
 
+The `diffusion/dflash/` folder is adapted from an early version of [DFlash](https://github.com/z-lab/dflash). You can also directly use the DFlash repository to evaluate DFlash draft models.
+
 See [diffusion/dflash/README.md](diffusion/dflash/README.md) for the DFlash evaluation entrypoints and links to the English / Chinese usage guides.
 
 ## Acknowledgements
 
-We thank the DFlash and EAGLE3 projects for their inspiring work on speculative decoding and draft-model training. We also thank [SpecForge](https://github.com/sgl-project/SpecForge), SGLang, and verl for the open-source infrastructure that this repository builds on.
+We thank [DFlash](https://github.com/z-lab/dflash) and [EAGLE3](https://github.com/SafeAILab/EAGLE) for their inspiring work on speculative decoding and draft-model training. We also thank [SpecForge](https://github.com/sgl-project/SpecForge), [SGLang](https://github.com/sgl-project/sglang), and [verl](https://github.com/volcengine/verl) for the open-source infrastructure that this repository builds on.
 
 ## Citation
 
