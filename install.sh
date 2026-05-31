@@ -1,5 +1,5 @@
 cd ./sglang-dflash
 pip install -e "./python"
 pip install cachetools
-cd ./verl
+cd ./../verl
 pip install -e .
