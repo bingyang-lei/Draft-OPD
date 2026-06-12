@@ -19,7 +19,7 @@
 /verl/examples/on_policy_distillation_trainer/*
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
-
+!/verl/examples/on_policy_distillation_trainer/run_qwen_30b-a3b.sh
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md
 /verl/my-purpose.md
