@@ -22,6 +22,7 @@
 
 ## News
 
+- [July 2026] The training data for Draft-OPD has been released and is available at `/data`.
 - [May 2026] Draft-OPD is available on arXiv: [2605.29343](https://arxiv.org/abs/2605.29343).
 - [May 2026] Released Draft-OPD model checkpoints are available in the [Hugging Face collection](https://huggingface.co/collections/bingyang-lei/draft-opd).
 
