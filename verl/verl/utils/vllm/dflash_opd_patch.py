@@ -271,19 +271,6 @@ def _record_verify_events_impl(
         )
         return
 
-    sampled = sampler_output.sampled_token_ids  # [batch, max_spec_len + 1]
-    if sampled is None or sampled.ndim != 2:
-        return
-    batch_size = sampled.shape[0]
-    if batch_size != len(req_ids):
-        return
-
-    draft_token_ids = spec_decode_metadata.draft_token_ids  # [num_tokens]
-    cu_num_draft = spec_decode_metadata.cu_num_draft_tokens.tolist()
-
-    # Slice this step's draft rows and align raw target logits.
-    raw_target_logits = logits[spec_decode_metadata.target_logits_indices]
-
     # Per-request accepted counts. A verify row always contains exactly
     # ``num_accepted + 1`` real tokens (accepted prefix + recovered/bonus
     # token) followed by PLACEHOLDER padding, so counting non-placeholder
@@ -302,18 +289,22 @@ def _record_verify_events_impl(
     # Slice this step's draft rows and align raw target logits.
     raw_target_logits = logits[spec_decode_metadata.target_logits_indices]
 
+    # Single device sync for the whole batch: per-row valid-token counts and
+    # the draft ids (needed only for the rare rejected events).
+    n_valid_per_row = (sampled != PLACEHOLDER_TOKEN_ID).sum(dim=1).tolist()
+    draft_ids_list = draft_token_ids.tolist()
+
     rejected_events: list[tuple[int, int, int, int]] = []  # (row, num_accepted, rejected_token, flat_draft_row)
     accepted_counts: list[int] = []
     row_start = 0
     for row in range(batch_size):
         n_draft = int(num_draft_per_req[row])
         row_end = row_start + n_draft
-        out_row = sampled[row]
-        n_valid = int((out_row != PLACEHOLDER_TOKEN_ID).sum().item())
+        n_valid = int(n_valid_per_row[row])
         n_accepted = max(min(n_valid - 1, n_draft), 0)
         accepted_counts.append(n_accepted)
         if 0 < n_draft and n_accepted < n_draft:
-            rejected_token = int(draft_token_ids[row_start + n_accepted].item())
+            rejected_token = int(draft_ids_list[row_start + n_accepted])
             rejected_events.append((row, n_accepted, rejected_token, row_start + n_accepted))
         row_start = row_end
 
@@ -341,10 +332,11 @@ def _record_verify_events_impl(
     for row in range(batch_size):
         req_id = req_ids[row]
         n_draft = int(num_draft_per_req[row])
-        if n_draft <= 0:
-            continue
         event_idx = event_idx_by_row.get(row)
         if event_idx is None:
+            # Includes n_draft == 0 rows (plain decode step): record them so
+            # the response-position replay in pop() still advances by the one
+            # sampled token and later anchors stay aligned.
             registry.record_step(req_id, accepted_counts[row], n_draft, -1, float("nan"))
         else:
             event = rejected_events[event_idx]

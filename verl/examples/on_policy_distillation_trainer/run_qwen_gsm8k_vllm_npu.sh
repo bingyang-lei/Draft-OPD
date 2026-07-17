@@ -15,6 +15,9 @@
 #   - torch_npu + CANN matching the vllm-ascend version, and vllm-ascend
 #     installed (provides the `dflash` speculative method).
 #   - See requirements-npu.txt.
+#
+# Recommended NPU runtime env (prevents allocator fragmentation OOM):
+#   export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:32
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -51,6 +54,13 @@ RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.2}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
+# First NPU bring-up runs eager (no aclgraph capture) to remove graph-mode
+# failure modes; set to False once the eager path is validated.
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+# vllm-ascend supports sleep/wake (worker.sleep/wake_up), so HYBRID colocate
+# works with the default free_cache_engine=True. If sleep proves unstable on
+# your stack, set ROLLOUT_FREE_CACHE_ENGINE=False to keep weights resident.
+ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your DFlash draft model path.
 NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-16} # DFlash block size K.
@@ -81,6 +91,8 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_NUM_TOKENS}" \
     actor_rollout_ref.rollout.agent.num_workers="${ROLLOUT_AGENT_NUM_WORKERS}" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
+    actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
+    actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
     ++actor_rollout_ref.rollout.mtp.enable=True \
     ++actor_rollout_ref.rollout.mtp.enable_rollout=True \
     ++actor_rollout_ref.rollout.mtp.method=dflash \
