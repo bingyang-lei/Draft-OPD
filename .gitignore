@@ -4,6 +4,7 @@
 !/.gitmodules
 !/README.md
 !/install.sh
+!/install_npu.sh
 !/verl/
 !/vllm
 !/vllm-ascend
