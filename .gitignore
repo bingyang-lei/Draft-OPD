@@ -1,9 +1,12 @@
 # Publish only the selected public repository content from this workspace.
 /*
 !/.gitignore
+!/.gitmodules
 !/README.md
 !/install.sh
 !/verl/
+!/vllm
+!/vllm-ascend
 !/sglang-dflash/
 !/diffusion/
 !/fig/

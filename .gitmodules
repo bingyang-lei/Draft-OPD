@@ -1,0 +1,8 @@
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/curnane-lab/vllm.git
+	branch = domino_npu_v0.21.0
+[submodule "vllm-ascend"]
+	path = vllm-ascend
+	url = https://github.com/curnane-lab/vllm-ascend.git
+	branch = domino_npu_v0.21.0rc1

@@ -38,6 +38,8 @@ This repository contains the public training and evaluation code for Draft-OPD. 
 | --- | --- |
 | `verl/` | Training code and the public OPD DFlash training entrypoint. |
 | `sglang-dflash/` | DFlash / SGLang runtime code used by training and evaluation. |
+| `vllm/` | vLLM submodule ([curnane-lab/vllm](https://github.com/curnane-lab/vllm), `domino_npu_v0.21.0`), frontend of the vLLM rollout path. |
+| `vllm-ascend/` | vLLM-Ascend submodule ([curnane-lab/vllm-ascend](https://github.com/curnane-lab/vllm-ascend), `domino_npu_v0.21.0rc1`), provides the `dflash` speculative method on Ascend NPU. |
 | `diffusion/` | Draft-OPD evaluation utilities, with the main benchmark workflow in `diffusion/dflash/`. |
 
 ## Training Entry Point
@@ -52,13 +54,27 @@ The script launches DFlash on-policy distillation through `verl`. It wraps `run_
 
 ## Install
 
+Clone with submodules (the `vllm/` and `vllm-ascend/` directories are git submodules pinned to tested commits):
+
+```bash
+git clone --recursive git@github.com:curnane-lab/Draft-OPD.git
+# or, if you already cloned without --recursive:
+git submodule update --init --recursive
+```
+
 From the repository root, run:
 
 ```bash
 bash install.sh
 ```
 
-This installs the editable `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
+This installs the editable `vllm`, `vllm-ascend`, `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
+
+### Ascend NPU notes
+
+- The vLLM rollout path requires a matching CANN / torch / torch-npu stack for the pinned vllm-ascend version (see `vllm-ascend/docs/source/installation.md`), plus `triton-ascend` (already listed in `verl/requirements-npu.txt`).
+- `install.sh` builds vLLM with `VLLM_TARGET_DEVICE=empty`; NPU kernels are provided by `vllm-ascend`.
+- To run the NPU + vLLM variant of the OPD trainer, use `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh` (the SGLang reference path remains `run_qwen_gsm8k_forward-ins.sh`).
 
 ## Quick Start
 
