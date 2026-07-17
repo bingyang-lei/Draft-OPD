@@ -12,12 +12,16 @@
 #   1. vllm          skip if `pip show vllm` exists (warns if not v0.21.x)
 #   2. vllm_ascend   skip if `pip show vllm_ascend` exists (warns if not 0.21.0rc*)
 #   3. triton-ascend skip if installed, else install ==3.2.1 (Huawei mirror)
-#   4. sglang        skip if `pip show sglang` exists, else install vendored sglang-dflash
+#   4. sglang        SKIPPED BY DEFAULT — the vLLM(vllm-ascend) path does not
+#                    use it, and the vendored CUDA-ecosystem sglang-dflash can
+#                    disturb the container's torch/torch_npu stack at install
+#                    time. Opt in with INSTALL_SGLANG_DFLASH=1 only if you need
+#                    the SGLang reference path; skip if `pip show sglang` exists.
 #   5. verl          skip if already editable-installed from THIS repo
 #
 # Overrides:
 #   FORCE_INSTALL_ENGINES=1  install engines from submodules even if detected
-#   SKIP_SGLANG_DFLASH=1     do not install the sglang engine
+#   INSTALL_SGLANG_DFLASH=1  also install the vendored sglang-dflash engine
 #   PYTHON=python3           interpreter to probe (default: python)
 #
 # NOTE: verl is installed WITHOUT extras on purpose. verl[vllm] pins
@@ -28,7 +32,7 @@ cd "$(dirname "$0")"
 
 PYTHON=${PYTHON:-python}
 FORCE_INSTALL_ENGINES=${FORCE_INSTALL_ENGINES:-0}
-SKIP_SGLANG_DFLASH=${SKIP_SGLANG_DFLASH:-0}
+INSTALL_SGLANG_DFLASH=${INSTALL_SGLANG_DFLASH:-0}
 
 log()  { echo -e "\033[1;32m[install_npu]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[install_npu][warn]\033[0m $*"; }
@@ -116,11 +120,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. sglang (alternative rollout engine; vendored sglang-dflash)
+# 4. sglang (skipped by default: the vLLM path does not use it)
 # ---------------------------------------------------------------------------
 sglang_ver=$(dist_version sglang || true)
-if [ "$SKIP_SGLANG_DFLASH" = "1" ]; then
-    log "SKIP_SGLANG_DFLASH=1 — skip sglang engine"
+if [ "$INSTALL_SGLANG_DFLASH" != "1" ]; then
+    log "sglang engine not needed on the vLLM path — skip (INSTALL_SGLANG_DFLASH=1 to opt in)"
 elif [ -n "$sglang_ver" ]; then
     log "sglang already installed ($sglang_ver) — skip"
 else
