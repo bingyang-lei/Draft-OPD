@@ -27,7 +27,7 @@ trap run_gpu_stress_test_on_exit EXIT
 ############################ Quick Config ############################
 cd "$REPO_ROOT"
 # source /path/to/miniconda3/bin/activate verl
-ROLLOUT_NAME="sglang" # sglang or vllm
+ROLLOUT_NAME="${ROLLOUT_NAME:-sglang}" # sglang or vllm
 
 MAIN_MODEL_PATH=${MAIN_MODEL_PATH:-""} # your model path.
 

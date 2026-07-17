@@ -309,6 +309,10 @@ class vLLMHttpServer:
                 "method": self.config.mtp.method,
                 "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
             }
+            # Separate draft checkpoint (e.g. method="dflash" for OPD rollouts).
+            draft_model_path = getattr(self.config.mtp, "draft_model_path", None)
+            if draft_model_path:
+                speculative_config["model"] = draft_model_path
             args["speculative_config"] = speculative_config
 
         if self.config.data_parallel_size > 1:

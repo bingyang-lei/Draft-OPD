@@ -67,6 +67,12 @@ class MtpConfig(BaseConfig):
     method: str = "mtp"
     num_speculative_tokens: int = 1
 
+    # vLLM rollout: standalone draft checkpoint for methods that use a
+    # separate draft model (e.g. "dflash", "eagle"). When set, it is passed
+    # as speculative_config["model"]. Leave None for target-integrated
+    # methods (e.g. "mtp").
+    draft_model_path: Optional[str] = None
+
 
 @dataclass
 class HFModelConfig(BaseConfig):
