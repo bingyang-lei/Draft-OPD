@@ -162,8 +162,25 @@ class ServerAdapter(BaseRollout):
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers.
+
+        When ``dflash_draft_only=True`` is passed (composed DFLASH/EAGLE3 OPD
+        student), only the ``draft_model.*`` subtree is streamed, renamed to
+        draft-relative keys, and the inference side loads it into the draft
+        model (speculative proposer) instead of the frozen target model.
+        """
+        from verl.workers.rollout.vllm_rollout.opd_utils import iter_opd_draft_weights
+
         start_time = time.time()
+
+        dflash_draft_only = bool(kwargs.pop("dflash_draft_only", False))
+        if dflash_draft_only and kwargs.get("peft_config") is not None:
+            raise ValueError("dflash_draft_only sync is not compatible with LoRA adapter sync.")
+
+        updated_tensor_count = 0
+        if dflash_draft_only:
+            weights = self._counting_draft_weights(iter_opd_draft_weights(weights))
+            kwargs["draft_model_only"] = True
 
         future = await self._execute_method(
             "update_weights_from_ipc",
@@ -182,6 +199,14 @@ class ServerAdapter(BaseRollout):
         if future is not None:
             await future
 
+        if dflash_draft_only:
+            updated_tensor_count = self._synced_draft_tensor_count
+            if updated_tensor_count == 0:
+                raise RuntimeError(
+                    "dflash_draft_only sync found no draft_model tensors. "
+                    "Check actor weight names and composed student configuration."
+                )
+
         # reset prefix cache after updating weights
         if self.rollout_rank == 0:
             await self.server_handle.clear_kv_cache.remote()
@@ -190,6 +215,17 @@ class ServerAdapter(BaseRollout):
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+
+        if dflash_draft_only:
+            if self.rollout_rank == 0:
+                logger.warning("DFLASH draft weight sync tensor_count=%s", updated_tensor_count)
+            return {"opd/weight_sync/draft_tensor_count": float(updated_tensor_count)}
+
+    def _counting_draft_weights(self, weights):
+        self._synced_draft_tensor_count = 0
+        for name, tensor in weights:
+            self._synced_draft_tensor_count += 1
+            yield name, tensor
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix matching the rollout type (e.g. 'vllm_' or 'vllm_omni_')."""
