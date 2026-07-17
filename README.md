@@ -68,12 +68,14 @@ From the repository root, run:
 bash install.sh
 ```
 
-This installs the editable `vllm`, `vllm-ascend`, `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
+`install.sh` wraps `install_npu.sh`, which **auto-detects already-installed components and skips them** (`vllm` / `vllm-ascend` / `triton-ascend` / `sglang` / `verl`). In a pre-provisioned NPU container this only installs `verl`; in a bare environment it also installs the engines from the submodules. The SGLang engine is skipped by default (the vLLM path does not use it); opt in with `INSTALL_SGLANG_DFLASH=1`, and force engine reinstall with `FORCE_INSTALL_ENGINES=1`.
+
+> **Note**: `verl` is always installed **without extras**. `verl[vllm]` pins `vllm<=0.12.0` and `verl[sglang]` pins `torch==2.9.1` — both break an NPU / vllm-ascend v0.21 stack.
 
 ### Ascend NPU notes
 
-- The vLLM rollout path requires a matching CANN / torch / torch-npu stack for the pinned vllm-ascend version (see `vllm-ascend/docs/source/installation.md`), plus `triton-ascend` (already listed in `verl/requirements-npu.txt`).
-- `install.sh` builds vLLM with `VLLM_TARGET_DEVICE=empty`; NPU kernels are provided by `vllm-ascend`.
+- The vLLM rollout path requires a matching CANN / torch / torch-npu stack for the pinned vllm-ascend version (see `vllm-ascend/docs/source/installation.md`), plus `triton-ascend` (already listed in `verl/requirements-npu.txt`). `install_npu.sh` checks and warns but never auto-installs torch/torch_npu.
+- `install.sh` builds vLLM with `VLLM_TARGET_DEVICE=empty` when the engine is not already present; NPU kernels are provided by `vllm-ascend`.
 - To run the NPU + vLLM variant of the OPD trainer, use `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh` (the SGLang reference path remains `run_qwen_gsm8k_forward-ins.sh`).
 
 ## Quick Start
