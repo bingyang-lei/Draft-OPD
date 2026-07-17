@@ -77,6 +77,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _is_composed_dflash_student(model_config: HFModelConfig) -> bool:
+    return bool(
+        getattr(model_config.hf_config, "verl_composed_dflash_student", False)
+        or getattr(model_config.hf_config, "verl_composed_eagle3_student", False)
+    )
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -127,6 +134,19 @@ class vLLMHttpServer:
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
+
+        self.is_composed_dflash_student = _is_composed_dflash_student(self.model_config)
+        if self.is_composed_dflash_student:
+            if self.config.load_format == "dummy":
+                logger.warning(
+                    "Composed OPD draft rollout trains only the draft model online, so vLLM target weights "
+                    "cannot be initialized with load_format=dummy. Set rollout load_format to auto."
+                )
+                self.config.load_format = "auto"
+            # Enable engine-side OPD reject-metadata recording in the vLLM
+            # workers (see verl.utils.vllm.dflash_opd_patch). Workers spawned
+            # after this point inherit the environment flag.
+            os.environ["VERL_DFLASH_OPD"] = "1"
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -521,6 +541,8 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+        if self.is_composed_dflash_student:
+            extra_fields.update(await self._collect_dflash_opd_fields(request_id, len(token_ids)))
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
@@ -551,6 +573,29 @@ class vLLMHttpServer:
             num_preempted=num_preempted,
             extra_fields=extra_fields,
         )
+
+    async def _collect_dflash_opd_fields(self, request_id: str, response_len: int) -> dict[str, Any]:
+        """Collect DFlash OPD reject metadata recorded by the engine workers.
+
+        The engine-side patch (verl.utils.vllm.dflash_opd_patch) records
+        speculative-verification reject events per request inside the worker
+        processes; retrieve them via collective_rpc and convert to the
+        ``dflash_*`` extra fields consumed by the agent loop / OPD losses.
+        """
+        from verl.utils.vllm.dflash_opd_patch import opd_enabled
+        from verl.workers.rollout.vllm_rollout.opd_utils import build_dflash_extra_fields, merge_dflash_metadata
+
+        if not opd_enabled():
+            return {}
+        try:
+            results = await self.engine.collective_rpc("get_dflash_opd_metadata", kwargs={"request_id": request_id})
+        except Exception:
+            logger.exception("failed to collect dflash opd metadata for request %s", request_id)
+            return {}
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        metadata = merge_dflash_metadata(iter(results))
+        return build_dflash_extra_fields(metadata, response_len)
 
     async def wake_up(self):
         if self.node_rank != 0:

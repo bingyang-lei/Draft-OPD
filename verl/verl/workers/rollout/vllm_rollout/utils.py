@@ -168,7 +168,32 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+
+        # 4. OPD: patch the rejection-sampler seam so DFlash verify metadata
+        # (reject positions, teacher logprobs) is recorded per request.
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
+            from verl.utils.vllm.dflash_opd_patch import apply_dflash_opd_patches
+
+            apply_dflash_opd_patches()
+
         return instance
+
+    def get_dflash_opd_metadata(self, request_id: str):
+        """Pop the recorded DFlash OPD reject metadata for a finished request.
+
+        Invoked via collective_rpc from the rollout frontend after a request
+        completes. Returns None when OPD recording is not active or the
+        request produced no speculative-verification events.
+        """
+        from verl.utils.vllm.dflash_opd_patch import get_dflash_opd_metadata as _get
+
+        return _get(request_id)
+
+    def gc_dflash_opd_metadata(self) -> int:
+        """Drop stale DFlash OPD registry entries (aborted requests)."""
+        from verl.utils.vllm.dflash_opd_patch import gc_dflash_opd_metadata as _gc
+
+        return _gc()
 
     def monkey_patch_model(self, vocab_size: int):
         # patch compute_logits to avoid sampling OOV token
