@@ -309,8 +309,10 @@ class vLLMColocateWorkerExtension:
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             elif draft_model_only:
                 draft_model = self._get_draft_model()
-                loaded_params = draft_model.load_weights(weights)
-                logger.info(f"Draft model weights loaded (async), loaded_params: {len(loaded_params)}")
+                # Note: DFlashQwen3ForCausalLM.load_weights returns None (it
+                # delegates to an inner AutoWeightsLoader), so count inputs.
+                draft_model.load_weights(weights)
+                logger.info(f"Draft model weights loaded (async), loaded_params: {len(weights)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
