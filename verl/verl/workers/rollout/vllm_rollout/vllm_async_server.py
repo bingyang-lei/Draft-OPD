@@ -84,6 +84,20 @@ def _is_composed_dflash_student(model_config: HFModelConfig) -> bool:
     )
 
 
+def _config_node_get(node, key, default=None):
+    """Read a field from a config node that may be a dataclass, DictConfig, or plain dict.
+
+    hydra instantiate with _convert_="partial" leaves structured nodes that lost
+    their ``_target_`` (e.g. a rollout.mtp node overwritten by ++ CLI overrides)
+    as plain dicts, so dataclass-style attribute access is not guaranteed.
+    """
+    if node is None:
+        return default
+    if hasattr(node, "get"):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -304,13 +318,14 @@ class vLLMHttpServer:
                 args["served_model_name"] = served_model_name
 
         # mtp (None for diffusion models; only LLM models use speculative decoding)
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+        mtp_config = getattr(self.config, "mtp", None)
+        if _config_node_get(mtp_config, "enable", False) and _config_node_get(mtp_config, "enable_rollout", False):
             speculative_config = {
-                "method": self.config.mtp.method,
-                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
+                "method": _config_node_get(mtp_config, "method", "mtp"),
+                "num_speculative_tokens": _config_node_get(mtp_config, "num_speculative_tokens", 1),
             }
             # Separate draft checkpoint (e.g. method="dflash" for OPD rollouts).
-            draft_model_path = getattr(self.config.mtp, "draft_model_path", None)
+            draft_model_path = _config_node_get(mtp_config, "draft_model_path", None)
             if draft_model_path:
                 speculative_config["model"] = draft_model_path
             args["speculative_config"] = speculative_config

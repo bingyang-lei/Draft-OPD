@@ -93,6 +93,7 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
     actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
+    ++actor_rollout_ref.rollout.mtp._target_=verl.workers.config.MtpConfig \
     ++actor_rollout_ref.rollout.mtp.enable=True \
     ++actor_rollout_ref.rollout.mtp.enable_rollout=True \
     ++actor_rollout_ref.rollout.mtp.method=dflash \
