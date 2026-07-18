@@ -147,3 +147,21 @@ def test_registry_teacher_logprob_nan_passthrough():
     registry.record_step("req-2", 1, 2, rejected_token_id=42, teacher_logprob=float("nan"))
     metadata = registry.pop("req-2")
     assert math.isnan(metadata["rejected_draft_teacher_logprobs"][0])
+
+
+def test_empty_dflash_extra_fields_sglang_parity():
+    from verl.workers.rollout.vllm_rollout.opd_utils import empty_dflash_extra_fields
+
+    fields = empty_dflash_extra_fields(response_len=7)
+    assert fields["dflash_reject_token_indices"] == []
+    assert fields["dflash_rejected_draft_anchor_indices"] == []
+    assert fields["dflash_rejected_draft_offsets"] == []
+    assert fields["dflash_rejected_draft_token_ids"] == []
+    assert fields["dflash_rejected_draft_teacher_logprobs"] == []
+    assert fields["dflash_reject_token_count"] == 0
+    assert fields["dflash_non_reject_token_count"] == 7
+    assert fields["dflash_empty_reject_token_indices"] == 1
+
+    zero = empty_dflash_extra_fields(response_len=0)
+    assert zero["dflash_non_reject_token_count"] == 0
+    assert zero["dflash_empty_reject_token_indices"] == 0

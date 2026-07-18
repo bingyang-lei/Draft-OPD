@@ -330,6 +330,21 @@ class vLLMHttpServer:
                 speculative_config["model"] = draft_model_path
             args["speculative_config"] = speculative_config
 
+        # DFlash OPD reject-metadata recording: activate whenever a dflash
+        # speculative config is in play — not only when the composed-student
+        # flag is set — so the metadata path works even if that flag does not
+        # propagate to this server process. Must happen before the engine
+        # (and its workers) are spawned so they inherit the env flag.
+        _spec_cfg = args.get("speculative_config") or {}
+        if self.is_composed_dflash_student or _spec_cfg.get("method") == "dflash":
+            os.environ["VERL_DFLASH_OPD"] = "1"
+        logger.info(
+            "DFLASH OPD rollout: composed_student=%s, speculative_config=%s, VERL_DFLASH_OPD=%s",
+            self.is_composed_dflash_student,
+            _spec_cfg or None,
+            os.environ.get("VERL_DFLASH_OPD"),
+        )
+
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
@@ -451,7 +466,34 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
+            await self._assert_dflash_opd_pipeline()
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+
+    async def _assert_dflash_opd_pipeline(self) -> None:
+        """Fail fast at startup when the OPD reject-metadata pipeline is broken.
+
+        Without this, a patch that failed to apply (or a missing drafter) only
+        surfaces at the first training step as 'reject metadata batch size
+        mismatch', after a full rollout phase.
+        """
+        results = await self.engine.collective_rpc("probe_dflash_opd")
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        probes = [r for r in results if r]
+        if not probes:
+            raise RuntimeError("DFLASH OPD probe returned no results from vLLM workers.")
+        not_patched = [r for r in probes if not r.get("patch_applied")]
+        no_drafter = [r for r in probes if not r.get("has_drafter")]
+        if not_patched or no_drafter:
+            raise RuntimeError(
+                "DFLASH OPD pipeline is not live on vLLM workers: "
+                f"patch_applied missing on {len(not_patched)}/{len(probes)} workers, "
+                f"drafter missing on {len(no_drafter)}/{len(probes)} workers, "
+                f"probes={probes}. Check that VERL_DFLASH_OPD=1 is set before engine spawn "
+                "and that speculative_config (method=dflash) is in effect."
+            )
+        logger.info("DFLASH OPD probe OK on %d worker(s): %s", len(probes), probes[0])
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -560,7 +602,7 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
-        if self.is_composed_dflash_student:
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
             extra_fields.update(await self._collect_dflash_opd_fields(request_id, len(token_ids)))
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -602,7 +644,11 @@ class vLLMHttpServer:
         ``dflash_*`` extra fields consumed by the agent loop / OPD losses.
         """
         from verl.utils.vllm.dflash_opd_patch import opd_enabled
-        from verl.workers.rollout.vllm_rollout.opd_utils import build_dflash_extra_fields, merge_dflash_metadata
+        from verl.workers.rollout.vllm_rollout.opd_utils import (
+            build_dflash_extra_fields,
+            empty_dflash_extra_fields,
+            merge_dflash_metadata,
+        )
 
         if not opd_enabled():
             return {}
@@ -614,6 +660,17 @@ class vLLMHttpServer:
         if not isinstance(results, (list, tuple)):
             results = [results]
         metadata = merge_dflash_metadata(iter(results))
+        if metadata is None:
+            if not getattr(self, "_opd_missing_logged", False):
+                self._opd_missing_logged = True
+                logger.info(
+                    "DFLASH OPD: no reject metadata returned for request %s "
+                    "(registry empty on workers — patch inactive or no verify events recorded)",
+                    request_id,
+                )
+            # SGLang parity: always emit the full key set, empty when no
+            # verify events were recorded for this request.
+            return empty_dflash_extra_fields(response_len)
         return build_dflash_extra_fields(metadata, response_len)
 
     async def wake_up(self):

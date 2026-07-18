@@ -195,6 +195,20 @@ class vLLMColocateWorkerExtension:
 
         return _gc()
 
+    def probe_dflash_opd(self) -> dict:
+        """Startup probe: report whether the OPD reject-metadata pipeline is live.
+
+        Used by the rollout frontend to fail fast at engine startup instead of
+        discovering a broken chain at the first training step.
+        """
+        runner = self.model_runner
+        spec_cfg = getattr(runner, "speculative_config", None)
+        return {
+            "patch_applied": bool(getattr(type(runner), "_dflash_opd_patched", False)),
+            "has_drafter": getattr(runner, "drafter", None) is not None,
+            "spec_method": getattr(spec_cfg, "method", None),
+        }
+
     def monkey_patch_model(self, vocab_size: int):
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)

@@ -160,6 +160,28 @@ def build_dflash_extra_fields(metadata: Optional[dict[str, Any]], response_len: 
     return extra_fields
 
 
+def empty_dflash_extra_fields(response_len: int) -> dict[str, Any]:
+    """Full ``dflash_*`` key set with empty values.
+
+    The SGLang rollout path emits a reject mask for *every* response when
+    speculative decoding is on (all-False when nothing was rejected), so each
+    sample always carries the dflash keys. Mirror that for requests that
+    produced no verify events at all (e.g. EOS immediately after prefill) —
+    otherwise a single short sample would make the composed-student input
+    builder fail the whole micro batch.
+    """
+    return {
+        DFLASH_REJECT_TOKEN_INDICES: [],
+        DFLASH_REJECTED_DRAFT_ANCHOR_INDICES: [],
+        DFLASH_REJECTED_DRAFT_OFFSETS: [],
+        DFLASH_REJECTED_DRAFT_TOKEN_IDS: [],
+        DFLASH_REJECTED_DRAFT_TEACHER_LOGPROBS: [],
+        "dflash_reject_token_count": 0,
+        "dflash_non_reject_token_count": max(response_len, 0),
+        "dflash_empty_reject_token_indices": int(response_len > 0),
+    }
+
+
 def merge_dflash_metadata(parts: Iterator[Optional[dict[str, Any]]]) -> Optional[dict[str, Any]]:
     """Merge per-rank metadata parts (from collective_rpc over TP workers).
 
