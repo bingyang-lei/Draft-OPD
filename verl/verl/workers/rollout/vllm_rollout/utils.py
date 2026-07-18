@@ -174,7 +174,10 @@ class vLLMColocateWorkerExtension:
         if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
             from verl.utils.vllm.dflash_opd_patch import apply_dflash_opd_patches
 
-            apply_dflash_opd_patches()
+            try:
+                apply_dflash_opd_patches()
+            except Exception:  # noqa: BLE001 — never kill the engine worker
+                logger.exception("dflash_opd_patch: apply_dflash_opd_patches raised unexpectedly")
 
         return instance
 

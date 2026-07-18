@@ -352,29 +352,43 @@ def _record_verify_events_impl(
 def apply_dflash_opd_patches() -> bool:
     """Idempotently wrap ``NPUModelRunner._sample`` to record reject metadata.
 
-    Returns True when the patch was (or already had been) applied.
+    Returns True when the patch was (or already had been) applied. Never
+    raises: any failure is logged and reported as False, so a version drift
+    in vllm-ascend cannot kill the engine workers at startup (the rollout
+    server's startup probe surfaces the broken state instead).
     """
     try:
         from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-    except ImportError:
-        logger.warning("dflash_opd_patch: vllm_ascend is not available; patch NOT applied")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dflash_opd_patch: vllm_ascend import failed (%r); patch NOT applied", exc)
         return False
 
-    if getattr(NPUModelRunner, "_dflash_opd_patched", False):
+    try:
+        if getattr(NPUModelRunner, "_dflash_opd_patched", False):
+            return True
+
+        original_sample = getattr(NPUModelRunner, "_sample", None)
+        if original_sample is None:
+            logger.warning(
+                "dflash_opd_patch: NPUModelRunner has no '_sample' attribute in this vllm-ascend "
+                "version (checked %s); patch NOT applied",
+                type(NPUModelRunner).__module__,
+            )
+            return False
+
+        def _sample_with_opd_recording(self, logits, spec_decode_metadata):
+            sampler_output = original_sample(self, logits, spec_decode_metadata)
+            if spec_decode_metadata is not None and opd_enabled():
+                _record_verify_events(self, spec_decode_metadata, logits, self.input_batch.sampling_metadata, sampler_output)
+            return sampler_output
+
+        NPUModelRunner._sample = _sample_with_opd_recording
+        NPUModelRunner._dflash_opd_patched = True
+        logger.info("dflash_opd_patch: NPUModelRunner._sample wrapped for OPD reject metadata recording")
         return True
-
-    original_sample = NPUModelRunner._sample
-
-    def _sample_with_opd_recording(self, logits, spec_decode_metadata):
-        sampler_output = original_sample(self, logits, spec_decode_metadata)
-        if spec_decode_metadata is not None and opd_enabled():
-            _record_verify_events(self, spec_decode_metadata, logits, self.input_batch.sampling_metadata, sampler_output)
-        return sampler_output
-
-    NPUModelRunner._sample = _sample_with_opd_recording
-    NPUModelRunner._dflash_opd_patched = True
-    logger.info("dflash_opd_patch: NPUModelRunner._sample wrapped for OPD reject metadata recording")
-    return True
+    except Exception:  # noqa: BLE001
+        logger.exception("dflash_opd_patch: failed to apply; patch NOT applied")
+        return False
 
 
 # ---------------------------------------------------------------------------
