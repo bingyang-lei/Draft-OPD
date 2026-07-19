@@ -308,6 +308,19 @@ def _record_verify_events_impl(
             rejected_events.append((row, n_accepted, rejected_token, row_start + n_accepted))
         row_start = row_end
 
+    # Debug: log-once dump of per-row acceptance stats for the first verify
+    # step. Enable with OPD_PATCH_DEBUG=1 in the rollout server environment.
+    if os.environ.get("OPD_PATCH_DEBUG") == "1" and not getattr(_record_verify_events_impl, "_dbg", False):
+        _record_verify_events_impl._dbg = True
+        logger.info(
+            "OPD_PATCH_DEBUG num_draft=%s n_valid=%s sampled_row0=%s draft_row0=%s rejected_events=%s",
+            num_draft_per_req,
+            n_valid_per_row,
+            sampled[0].detach().cpu().tolist(),
+            draft_ids_list[: int(num_draft_per_req[0]) if num_draft_per_req else 8],
+            rejected_events[:4],
+        )
+
     teacher_lps: dict[int, float] = {}
     if rejected_events:
         rows = torch.tensor([e[3] for e in rejected_events], device=raw_target_logits.device, dtype=torch.long)
