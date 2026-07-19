@@ -602,6 +602,17 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+        # Debug: sample a few finished responses (token ids) to spot
+        # degenerate generation (e.g. all-zero outputs). OPD_PATCH_DEBUG=1.
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_resp_dbg_count", 0) < 3:
+            self._opd_resp_dbg_count = getattr(self, "_opd_resp_dbg_count", 0) + 1
+            logger.info(
+                "OPD_PATCH_DEBUG response sample n=%d req=%s len=%d first32=%s",
+                self._opd_resp_dbg_count,
+                request_id,
+                len(token_ids),
+                list(token_ids[:32]),
+            )
         if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
             extra_fields.update(await self._collect_dflash_opd_fields(request_id, len(token_ids)))
         log_probs = None

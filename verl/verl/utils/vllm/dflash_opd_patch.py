@@ -261,6 +261,11 @@ def _record_verify_events_impl(
     if not req_ids:
         return
 
+    # Do not record engine warmup/profile dummy runs: their inputs/outputs
+    # are all-zero placeholders that would pollute the registry.
+    if str(req_ids[0]).startswith(("_dummy", "dummy")):
+        return
+
     num_draft_per_req = list(spec_decode_metadata.num_draft_tokens)
     if len(num_draft_per_req) != len(req_ids):
         # Row order/length mismatch; skip rather than record garbage.
@@ -308,25 +313,32 @@ def _record_verify_events_impl(
             rejected_events.append((row, n_accepted, rejected_token, row_start + n_accepted))
         row_start = row_end
 
-    # Debug: dump per-row acceptance stats for the first few verify steps,
-    # including the request id (to tell real traffic from dummy/profile runs)
-    # and the target logits magnitude (to spot degenerate forward passes).
+    # Debug: dump per-row acceptance stats for the first few verify steps
+    # and every 500th step afterwards, including the request id (to tell
+    # real traffic from dummy/profile runs), the target logits magnitude
+    # (to spot degenerate forward passes) and an all-zero flag.
     # Enable with OPD_PATCH_DEBUG=1 in the rollout server environment.
     if os.environ.get("OPD_PATCH_DEBUG") == "1":
-        _dbg_cnt = getattr(_record_verify_events_impl, "_dbg_cnt", 0)
-        if _dbg_cnt < 8:
-            _record_verify_events_impl._dbg_cnt = _dbg_cnt + 1
+        _dbg = getattr(_record_verify_events_impl, "_dbg", None)
+        if _dbg is None:
+            _dbg = _record_verify_events_impl._dbg = {"calls": 0, "logged": 0}
+        _dbg["calls"] += 1
+        if _dbg["logged"] < 8 or _dbg["calls"] % 500 == 0:
+            _dbg["logged"] += 1
+            row0 = sampled[0].detach().cpu().tolist()
+            draft0 = draft_ids_list[: int(num_draft_per_req[0]) if num_draft_per_req else 8]
             logger.info(
-                "OPD_PATCH_DEBUG n=%d req0=%s num_draft=%s n_valid=%s sampled_row0=%s draft_row0=%s "
-                "rejected_events=%s logits_absmax=%.4f",
-                _dbg_cnt,
+                "OPD_PATCH_DEBUG call=%d req0=%s num_draft=%s n_valid=%s sampled_row0=%s draft_row0=%s "
+                "rejected_events=%s logits_absmax=%.4f allzero=%s",
+                _dbg["calls"],
                 req_ids[0],
                 num_draft_per_req,
                 n_valid_per_row,
-                sampled[0].detach().cpu().tolist(),
-                draft_ids_list[: int(num_draft_per_req[0]) if num_draft_per_req else 8],
+                row0,
+                draft0,
                 rejected_events[:4],
                 float(raw_target_logits.abs().max().item()) if raw_target_logits.numel() else float("nan"),
+                not any(row0) and not any(draft0),
             )
 
     teacher_lps: dict[int, float] = {}
