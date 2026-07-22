@@ -25,6 +25,11 @@ cd "$REPO_ROOT"
 
 export ROLLOUT_NAME="vllm"
 
+# Default to NPUs 8-15 (8 cards total), matching the default split
+# STUDENT_WORLD_SIZE=7 + TEACHER_WORLD_SIZE=1 below. Override by exporting
+# ASCEND_RT_VISIBLE_DEVICES (and the world sizes) before launching.
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}
+
 DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k3}
 REVERSE_KL_WEIGHT=${REVERSE_KL_WEIGHT:-0.0}
 FORWARD_KL_WEIGHT=${FORWARD_KL_WEIGHT:-1.0}
