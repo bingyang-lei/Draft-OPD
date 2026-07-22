@@ -64,13 +64,13 @@ ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
 # 2-5x generation time. Set ROLLOUT_ENFORCE_EAGER=True only for bring-up or
 # debugging to remove graph-mode failure modes.
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
-# Keep rollout weights resident by default: skipping the HYBRID sleep/wake
-# cycle avoids offloading and restoring the full weight set between NPU and
-# host RAM on every step (two full copies per engine per step, plus the KV
-# rebuild). Set ROLLOUT_FREE_CACHE_ENGINE=True if update_actor OOMs on
-# activation memory (sleep level=1 still preserves the frozen DFlash target
-# weights correctly, it just pays the copy cost).
-ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-False}
+# Sleep the rollout engine during update_actor (HYBRID colocate). Sleep
+# level=1 keeps a host copy (frozen DFlash target survives, f113a95) at the
+# price of one offload+restore per step. Resident weights (False) only fit
+# when training memory is small enough — e.g. gradient checkpointing on;
+# with enable_gradient_checkpointing=False the 4.6k-token activations OOM
+# the card during backward (61G total ≈ 27G engine + 28G training + 8.5G).
+ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
 # Graph capture footprint for the student rollout engine: PIECEWISE-only
 # with a small size list. The verl default (FULL_AND_PIECEWISE with ~35
 # sizes) exhausts NPU driver stream/queue resources when a student engine
