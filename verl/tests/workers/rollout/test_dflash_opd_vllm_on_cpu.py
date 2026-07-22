@@ -173,6 +173,36 @@ def test_registry_pop_missing_request_returns_none():
     assert DFlashOpdMetadataRegistry().pop("nope") is None
 
 
+def test_registry_pop_matches_engine_suffixed_request_id():
+    # The engine records under input_batch.req_ids, which vLLM suffixes as
+    # "<base>-<tag>"; the frontend pops with the base id it passed to generate().
+    registry = DFlashOpdMetadataRegistry()
+    base = "17edb0fe1b494949b81adda2a96ab123"
+    engine_key = f"{base}-b50b54a4"
+    registry.record_step(engine_key, 1, 7, rejected_token_id=1438, teacher_logprob=-0.5)
+
+    metadata = registry.pop(base)
+    assert metadata is not None
+    assert metadata["rejected_draft_anchor_indices"] == [2]
+    assert metadata["rejected_draft_token_ids"] == [1438]
+    # Consumed.
+    assert registry.pop(base) is None
+
+
+def test_registry_pop_prefers_exact_key_over_suffix_match():
+    registry = DFlashOpdMetadataRegistry()
+    registry.record_step("abc", 0, 7, rejected_token_id=10, teacher_logprob=-0.1)
+    registry.record_step("abc-xyz", 0, 7, rejected_token_id=20, teacher_logprob=-0.2)
+
+    exact = registry.pop("abc")
+    assert exact is not None
+    assert exact["rejected_draft_token_ids"] == [10]
+    # The suffixed entry is still retrievable afterwards.
+    suffixed = registry.pop("abc")
+    assert suffixed is not None
+    assert suffixed["rejected_draft_token_ids"] == [20]
+
+
 def test_build_dflash_extra_fields_matches_sglang_contract():
     metadata = {
         "rejected_draft_anchor_indices": [3, 9],

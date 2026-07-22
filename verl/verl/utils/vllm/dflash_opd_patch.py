@@ -127,11 +127,35 @@ class DFlashOpdMetadataRegistry:
     # ------------------------------------------------------------------
     # Retrieval (frontend side, via collective_rpc on the worker extension)
     # ------------------------------------------------------------------
+    def _resolve_req_key(self, req_id: str) -> Optional[str]:
+        """Resolve the frontend request id to the key events were recorded under.
+
+        The frontend pops with the request id it passed to ``engine.generate``
+        (e.g. ``uuid4().hex``), but the engine records under
+        ``model_runner.input_batch.req_ids``, which vLLM may suffix with a
+        per-request tag (observed: ``<base>-<8hex>``). Match the base id exactly
+        first, then fall back to a ``"<base>-"`` prefix match. The base id is
+        unique per request/turn, so at most one recorded key matches; if several
+        do, prefer the most recently updated one.
+        """
+        if req_id in self._events:
+            return req_id
+        prefix = f"{req_id}-"
+        matches = [key for key in self._events if key.startswith(prefix)]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            matches.sort(key=lambda key: self._timestamps.get(key, 0.0))
+        return matches[-1]
+
     def pop(self, req_id: str) -> Optional[dict[str, Any]]:
         """Pop and materialize the OPD metadata dict for a finished request."""
-        events = self._events.pop(req_id, None)
-        self._response_lens.pop(req_id, None)
-        self._timestamps.pop(req_id, None)
+        key = self._resolve_req_key(req_id)
+        if key is None:
+            return None
+        events = self._events.pop(key, None)
+        self._response_lens.pop(key, None)
+        self._timestamps.pop(key, None)
         if events is None:
             return None
 
@@ -488,14 +512,17 @@ def get_dflash_opd_metadata(request_id: str) -> Optional[dict[str, Any]]:
 def peek_dflash_opd_metadata(request_id: str) -> Optional[dict[str, Any]]:
     """Read without popping (debugging)."""
     registry = get_registry()
-    events = registry._events.get(request_id)
+    key = registry._resolve_req_key(request_id)
+    if key is None:
+        return None
+    events = registry._events.get(key)
     if events is None:
         return None
     # Materialize a copy via pop on a shadow registry.
     shadow = DFlashOpdMetadataRegistry()
-    shadow._events[request_id] = list(events)
-    shadow._response_lens[request_id] = registry._response_lens.get(request_id, 1)
-    return shadow.pop(request_id)
+    shadow._events[key] = list(events)
+    shadow._response_lens[key] = registry._response_lens.get(key, 1)
+    return shadow.pop(key)
 
 
 def gc_dflash_opd_metadata() -> int:
