@@ -59,6 +59,11 @@ REJECTED_DRAFT_POSITION_DECAY=${REJECTED_DRAFT_POSITION_DECAY:-0.8}
 RANDOM_RESPONSE_ANCHOR_ENABLED=${RANDOM_RESPONSE_ANCHOR_ENABLED:-False}
 RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
+# Hard cap on OPD anchors per sample. Each anchor costs a draft_block_size
+# (16)-token draft segment in the trainer forward; uncapped rejection counts
+# (~450 mean, >1k on long responses) OOM the 61G card during update_actor.
+# ~186 anchors keeps peak memory within budget. 0 disables the cap.
+DFLASH_MAX_RESPONSE_ANCHORS=${DFLASH_MAX_RESPONSE_ANCHORS:-186}
 # FlexAttention is not supported on NPU (transformers validates the device
 # and raises ValueError); use sdpa for the trainer-side DFlash draft forward.
 export DFLASH_ATTENTION_IMPL=${DFLASH_ATTENTION_IMPL:-sdpa}
@@ -106,6 +111,7 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_lm_head_chunk_size="${DFLASH_LM_HEAD_CHUNK_SIZE}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_enabled="${RANDOM_RESPONSE_ANCHOR_ENABLED}" \
     ++actor_rollout_ref.model.override_config.verl_dflash_random_response_anchor_seed="${RANDOM_RESPONSE_ANCHOR_SEED}" \
+    ++actor_rollout_ref.model.override_config.verl_dflash_max_response_anchors="${DFLASH_MAX_RESPONSE_ANCHORS}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \

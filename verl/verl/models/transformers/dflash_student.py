@@ -326,6 +326,15 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             raise ValueError(f"verl_dflash_response_anchor_stride must be positive, got {stride}.")
         return stride
 
+    def _get_max_response_anchors(self) -> int:
+        """Hard cap on anchors per sample (0 = unlimited). Each anchor costs a
+        draft_block_size-token draft segment in the trainer forward, so an
+        uncapped rejection count can blow up activation memory."""
+        value = getattr(self.config, "verl_dflash_max_response_anchors", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_MAX_RESPONSE_ANCHORS", "0")
+        return int(value)
+
     def _get_random_response_anchor_enabled(self) -> bool:
         value = getattr(self.config, "verl_dflash_random_response_anchor_enabled", None)
         if value is None:
@@ -491,6 +500,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         reject_token_indices: torch.LongTensor,
         draft_block_size: int,
         response_anchor_stride: int = 1,
+        max_response_anchors: int = 0,
         random_response_anchor_enabled: bool = False,
         random_response_anchor_seed: int = 42,
         rejected_draft_anchor_indices: Optional[torch.LongTensor] = None,
@@ -544,6 +554,21 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     for pair_idx, pair in enumerate(anchor_boundary_pairs)
                     if pair_idx % response_anchor_stride == 0 or pair_idx == len(anchor_boundary_pairs) - 1
                 ]
+                anchors_resp = [pair[0] for pair in anchor_boundary_pairs]
+                boundaries_resp = [pair[1] for pair in anchor_boundary_pairs]
+
+            if max_response_anchors > 0 and len(anchors_resp) > max_response_anchors:
+                # Hard cap: evenly subsample anchor/boundary pairs down to the
+                # cap, always keeping the last pair so the final segment still
+                # reaches the response end. Dropped pairs merge neighboring
+                # segments, which are capped at draft_block_size-1 below anyway.
+                anchor_boundary_pairs = list(zip(anchors_resp, boundaries_resp, strict=False))
+                n = len(anchor_boundary_pairs)
+                if max_response_anchors == 1:
+                    keep = [n - 1]
+                else:
+                    keep = sorted({(i * (n - 1)) // (max_response_anchors - 1) for i in range(max_response_anchors)})
+                anchor_boundary_pairs = [anchor_boundary_pairs[i] for i in keep]
                 anchors_resp = [pair[0] for pair in anchor_boundary_pairs]
                 boundaries_resp = [pair[1] for pair in anchor_boundary_pairs]
             sample_anchors: list[int] = []
@@ -978,6 +1003,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         draft_block_size = self._get_block_size()
         lm_head_chunk_size = self._get_lm_head_chunk_size()
         response_anchor_stride = self._get_response_anchor_stride()
+        max_response_anchors = self._get_max_response_anchors()
         random_response_anchor_enabled = self._get_random_response_anchor_enabled()
         random_response_anchor_seed = self._get_random_response_anchor_seed()
         rejected_draft_max_tokens_per_sample = self._get_rejected_draft_max_tokens_per_sample()
@@ -991,6 +1017,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 reject_token_indices=reject_token_indices,
                 draft_block_size=draft_block_size,
                 response_anchor_stride=response_anchor_stride,
+                max_response_anchors=max_response_anchors,
                 random_response_anchor_enabled=random_response_anchor_enabled,
                 random_response_anchor_seed=random_response_anchor_seed,
                 rejected_draft_anchor_indices=rejected_draft_anchor_indices,
