@@ -17,8 +17,17 @@ import inspect
 import json
 import logging
 import os
+import sys
 from pprint import pprint
 from typing import Any, Callable, Optional
+
+
+def _opd_dbg(msg: str, *args) -> None:
+    """OPD_PATCH_DEBUG output that bypasses the server logger (whose records
+    never surface through this actor's logging setup) and writes straight to
+    stderr so ray captures and forwards it."""
+    if os.environ.get("OPD_PATCH_DEBUG") == "1":
+        print("OPD_PATCH_DEBUG " + (msg % args if args else msg), file=sys.stderr, flush=True)
 
 import ray
 import vllm.entrypoints.cli.serve
@@ -606,8 +615,8 @@ class vLLMHttpServer:
         # degenerate generation (e.g. all-zero outputs). OPD_PATCH_DEBUG=1.
         if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_resp_dbg_count", 0) < 3:
             self._opd_resp_dbg_count = getattr(self, "_opd_resp_dbg_count", 0) + 1
-            logger.info(
-                "OPD_PATCH_DEBUG response sample n=%d req=%s len=%d first32=%s",
+            _opd_dbg(
+                "response sample n=%d req=%s len=%d first32=%s",
                 self._opd_resp_dbg_count,
                 request_id,
                 len(token_ids),
@@ -676,8 +685,8 @@ class vLLMHttpServer:
         # survive the in-response filter. OPD_PATCH_DEBUG=1.
         if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg", 0) < 8:
             self._opd_collect_dbg = getattr(self, "_opd_collect_dbg", 0) + 1
-            logger.info(
-                "OPD_PATCH_DEBUG collect req=%s resp_len=%d metadata=%s",
+            _opd_dbg(
+                "collect req=%s resp_len=%d metadata=%s",
                 request_id,
                 response_len,
                 None
@@ -702,8 +711,8 @@ class vLLMHttpServer:
         fields = build_dflash_extra_fields(metadata, response_len)
         if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg2", 0) < 8:
             self._opd_collect_dbg2 = getattr(self, "_opd_collect_dbg2", 0) + 1
-            logger.info(
-                "OPD_PATCH_DEBUG built req=%s kept_rejects=%s first=%s",
+            _opd_dbg(
+                "built req=%s kept_rejects=%s first=%s",
                 request_id,
                 fields.get("dflash_reject_token_count"),
                 fields.get("dflash_reject_token_indices", [])[:8],
