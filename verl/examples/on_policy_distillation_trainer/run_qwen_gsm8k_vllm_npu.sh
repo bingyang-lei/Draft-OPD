@@ -71,6 +71,15 @@ ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 # activation memory (sleep level=1 still preserves the frozen DFlash target
 # weights correctly, it just pays the copy cost).
 ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-False}
+# Graph capture footprint for the student rollout engine: PIECEWISE-only
+# with a small size list. The verl default (FULL_AND_PIECEWISE with ~35
+# sizes) exhausts NPU driver stream/queue resources when a student engine
+# colocates with the FSDP trainer on one card (AclmdlRICaptureBegin 207005).
+# JSON string consumed by vllm_async_server via json.loads.
+VLLM_COMPILATION_CONFIG=${VLLM_COMPILATION_CONFIG:-'{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[8,16,32,64]}'}
+# Escape embedded double quotes so the value survives as ONE hydra string
+# override (a raw JSON token fails hydra's override grammar).
+_VLLM_COMPILATION_CONFIG_ESCAPED=${VLLM_COMPILATION_CONFIG//\"/\\\"}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your DFlash draft model path.
 NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-7} # DFlash block size K.
@@ -109,6 +118,7 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.rollout.mtp.method=dflash \
     ++actor_rollout_ref.rollout.mtp.num_speculative_tokens="${NUM_SPECULATIVE_TOKENS}" \
     ++actor_rollout_ref.rollout.mtp.draft_model_path="${DRAFT_MODEL_PATH}" \
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config=\"${_VLLM_COMPILATION_CONFIG_ESCAPED}\"" \
     distillation.n_gpus_per_node="${TEACHER_WORLD_SIZE}" \
     distillation.teacher_models.teacher_model.inference.max_model_len="${MAX_NUM_TOKENS}" \
     distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${MAX_NUM_TOKENS}" \
