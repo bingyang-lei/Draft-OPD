@@ -59,9 +59,11 @@ RANDOM_RESPONSE_ANCHOR_SEED=${RANDOM_RESPONSE_ANCHOR_SEED:-42}
 DFLASH_LM_HEAD_CHUNK_SIZE=${DFLASH_LM_HEAD_CHUNK_SIZE:-512}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.2}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
-# First NPU bring-up runs eager (no aclgraph capture) to remove graph-mode
-# failure modes; set to False once the eager path is validated.
-ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
+# Graph mode (aclgraph capture) is the default now that the dflash rollout
+# path is validated; eager runs each decode step kernel-by-kernel and costs
+# 2-5x generation time. Set ROLLOUT_ENFORCE_EAGER=True only for bring-up or
+# debugging to remove graph-mode failure modes.
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 # vllm-ascend supports sleep/wake (worker.sleep/wake_up), so HYBRID colocate
 # works with the default free_cache_engine=True. If sleep proves unstable on
 # your stack, set ROLLOUT_FREE_CACHE_ENGINE=False to keep weights resident.
