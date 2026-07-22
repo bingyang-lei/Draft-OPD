@@ -369,9 +369,19 @@ def _record_verify_events_impl(
             _dbg["logged"] += 1
             row0 = sampled[0].detach().cpu().tolist()
             draft0 = draft_ids_list[: int(num_draft_per_req[0]) if num_draft_per_req else 8]
+            # Report the *finite* logit magnitude: compute_logits() masks the
+            # padded/OOV vocab columns with -inf (see monkey_patch_compute_logits),
+            # so a raw abs().max() is always inf and says nothing about forward
+            # health. finite_absmax is nan only if the whole forward is non-finite
+            # (genuinely degenerate) and otherwise a sane magnitude (~1e1).
+            if raw_target_logits.numel():
+                _finite = raw_target_logits[torch.isfinite(raw_target_logits)]
+                finite_absmax = float(_finite.abs().max().item()) if _finite.numel() else float("nan")
+            else:
+                finite_absmax = float("nan")
             logger.info(
                 "OPD_PATCH_DEBUG call=%d req0=%s num_draft=%s n_valid=%s accepted=%s sampled_row0=%s draft_row0=%s "
-                "rejected_events=%s logits_absmax=%.4f allzero=%s",
+                "rejected_events=%s logits_finite_absmax=%.4f allzero=%s",
                 _dbg["calls"],
                 req_ids[0],
                 num_draft_per_req,
@@ -380,7 +390,7 @@ def _record_verify_events_impl(
                 row0,
                 draft0,
                 rejected_events[:4],
-                float(raw_target_logits.abs().max().item()) if raw_target_logits.numel() else float("nan"),
+                finite_absmax,
                 not any(row0) and not any(draft0),
             )
 
