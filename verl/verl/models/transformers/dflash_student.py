@@ -893,7 +893,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         try:
             with self._draft_sdpa_context():
                 draft_hidden = _maybe_checkpoint_draft_forward()
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
+            # FlexAttention raises ValueError on unsupported devices (e.g. NPU),
+            # RuntimeError for kernel-level failures; both fall back to sdpa.
             if attn_impl != "flex_attention" or self._is_oom_error(exc):
                 raise
             logger.warning(
