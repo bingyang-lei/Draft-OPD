@@ -671,6 +671,23 @@ class vLLMHttpServer:
         if not isinstance(results, (list, tuple)):
             results = [results]
         metadata = merge_dflash_metadata(iter(results))
+        # Debug: trace the collect side of the OPD metadata chain — whether
+        # pop() found events, how many anchors they carried, and how many
+        # survive the in-response filter. OPD_PATCH_DEBUG=1.
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg", 0) < 8:
+            self._opd_collect_dbg = getattr(self, "_opd_collect_dbg", 0) + 1
+            logger.info(
+                "OPD_PATCH_DEBUG collect req=%s resp_len=%d metadata=%s",
+                request_id,
+                response_len,
+                None
+                if metadata is None
+                else {
+                    "anchors": len(metadata.get("rejected_draft_anchor_indices", [])),
+                    "verify_steps": metadata.get("_num_verify_steps"),
+                    "first_anchors": metadata.get("rejected_draft_anchor_indices", [])[:8],
+                },
+            )
         if metadata is None:
             if not getattr(self, "_opd_missing_logged", False):
                 self._opd_missing_logged = True
@@ -682,7 +699,16 @@ class vLLMHttpServer:
             # SGLang parity: always emit the full key set, empty when no
             # verify events were recorded for this request.
             return empty_dflash_extra_fields(response_len)
-        return build_dflash_extra_fields(metadata, response_len)
+        fields = build_dflash_extra_fields(metadata, response_len)
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg2", 0) < 8:
+            self._opd_collect_dbg2 = getattr(self, "_opd_collect_dbg2", 0) + 1
+            logger.info(
+                "OPD_PATCH_DEBUG built req=%s kept_rejects=%s first=%s",
+                request_id,
+                fields.get("dflash_reject_token_count"),
+                fields.get("dflash_reject_token_indices", [])[:8],
+            )
+        return fields
 
     async def wake_up(self):
         if self.node_rank != 0:
