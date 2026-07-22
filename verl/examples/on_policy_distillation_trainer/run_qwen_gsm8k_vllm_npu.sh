@@ -91,6 +91,10 @@ VLLM_COMPILATION_CONFIG=${VLLM_COMPILATION_CONFIG:-'{"cudagraph_mode":"PIECEWISE
 # override (a raw JSON token fails hydra's override grammar).
 _VLLM_COMPILATION_CONFIG_ESCAPED=${VLLM_COMPILATION_CONFIG//\"/\\\"}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
+# Required for the composed-student OPD forward on 61G cards: without
+# checkpointing, the uncached activations of the 4609-token target forward
+# plus the draft segments OOM update_actor even with the anchor cap.
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-True}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your DFlash draft model path.
 NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-7} # DFlash block size K.
 TRAIN_JSONL=${TRAIN_JSONL:-""} # your data path.
@@ -114,6 +118,7 @@ exec "${SCRIPT_DIR}/run_qwen_gsm8k.sh" \
     ++actor_rollout_ref.model.override_config.verl_dflash_max_response_anchors="${DFLASH_MAX_RESPONSE_ANCHORS}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_PROMPT_BSZ}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
+    actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${STUDENT_MAX_TOKEN_LEN_PER_GPU}" \
