@@ -19,12 +19,51 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl.utils.vllm.dflash_opd_patch import DFlashOpdMetadataRegistry
+from verl.utils.vllm.dflash_opd_patch import DFlashOpdMetadataRegistry, compute_dflash_num_accepted
 from verl.workers.rollout.vllm_rollout.opd_utils import (
     build_dflash_extra_fields,
     iter_opd_draft_weights,
     map_opd_draft_weight_name,
 )
+
+# PLACEHOLDER_TOKEN_ID in vLLM v1 is -1; use a sentinel here to avoid importing vllm.
+_PH = -1
+
+
+def test_num_accepted_stock_placeholder_full_accept():
+    # 4 drafts all accepted + bonus, rest padded -> num_accepted == n_draft.
+    draft = [10, 11, 12, 13]
+    sampled = [10, 11, 12, 13, 99, _PH, _PH]  # accepted prefix + bonus, then padding
+    n_valid = 5  # 4 accepted + 1 bonus
+    assert compute_dflash_num_accepted(n_valid=n_valid, n_draft=4, sampled_row=sampled, draft_row=draft) == 4
+
+
+def test_num_accepted_stock_placeholder_rejection():
+    # Reject at position 2: sampled[2] is the recovered target token, != draft[2].
+    draft = [10, 11, 12, 13]
+    sampled = [10, 11, 55, _PH, _PH, _PH, _PH]
+    n_valid = 3  # 2 accepted + 1 recovered
+    assert compute_dflash_num_accepted(n_valid=n_valid, n_draft=4, sampled_row=sampled, draft_row=draft) == 2
+
+
+def test_num_accepted_ascend_no_placeholder_padding():
+    # vllm-ascend style: row is fully filled (no PLACEHOLDER padding), so the
+    # placeholder count reports full acceptance, but the matching prefix detects
+    # the real rejection at position 2.
+    draft = [10, 11, 12, 13]
+    sampled = [10, 11, 55, 77, 88]  # no placeholders anywhere
+    n_valid = 5  # placeholder count would say "all 4 accepted"
+    assert compute_dflash_num_accepted(n_valid=n_valid, n_draft=4, sampled_row=sampled, draft_row=draft) == 2
+
+
+def test_num_accepted_reject_at_first_position():
+    draft = [10, 11, 12, 13]
+    sampled = [99, 88, 77, 66, 55]
+    assert compute_dflash_num_accepted(n_valid=5, n_draft=4, sampled_row=sampled, draft_row=draft) == 0
+
+
+def test_num_accepted_no_speculation_is_zero():
+    assert compute_dflash_num_accepted(n_valid=1, n_draft=0, sampled_row=[42], draft_row=[]) == 0
 
 
 class _FakeEngine:

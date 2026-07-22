@@ -182,6 +182,42 @@ def get_registry() -> DFlashOpdMetadataRegistry:
     return _REGISTRY
 
 
+def compute_dflash_num_accepted(
+    *,
+    n_valid: int,
+    n_draft: int,
+    sampled_row: list[int],
+    draft_row: list[int],
+) -> int:
+    """Number of accepted speculative draft tokens for one verify row.
+
+    Two independent signals are combined and the smaller is taken, so the
+    result never over-reports acceptance (never silently drops a rejection):
+
+    - Placeholder count: stock vLLM v1 pads the rejected tail of
+      ``sampled_token_ids`` with ``PLACEHOLDER_TOKEN_ID``, so the number of
+      non-placeholder tokens is ``num_accepted + 1`` (accepted prefix plus the
+      bonus/recovered token). ``n_valid`` is that count.
+    - Matching prefix: an *accepted* speculative token is, by definition, the
+      draft token at that position, so ``sampled_row[j] == draft_row[j]`` for
+      every accepted ``j`` and the first mismatch is the rejection point.
+
+    The matching-prefix signal is required for backends that do not use
+    ``PLACEHOLDER_TOKEN_ID`` padding (e.g. vllm-ascend's ``AscendRejectionSampler``).
+    On those, the placeholder count reports full acceptance every step
+    (``num_accepted == num_draft``), which would drop every rejection anchor and
+    leave OPD with zero effective tokens even though generation is healthy.
+    """
+    if n_draft <= 0:
+        return 0
+    placeholder_accepted = max(min(n_valid - 1, n_draft), 0)
+    match_len = 0
+    limit = min(n_draft, len(sampled_row), len(draft_row))
+    while match_len < limit and int(sampled_row[match_len]) == int(draft_row[match_len]):
+        match_len += 1
+    return min(placeholder_accepted, match_len)
+
+
 # ---------------------------------------------------------------------------
 # Teacher logprob of arbitrary tokens under tensor parallelism.
 # ---------------------------------------------------------------------------
@@ -294,9 +330,11 @@ def _record_verify_events_impl(
     # Slice this step's draft rows and align raw target logits.
     raw_target_logits = logits[spec_decode_metadata.target_logits_indices]
 
-    # Single device sync for the whole batch: per-row valid-token counts and
-    # the draft ids (needed only for the rare rejected events).
+    # Single device sync for the whole batch: per-row valid-token counts, the
+    # sampled token ids (for the matching-prefix acceptance signal) and the
+    # draft ids.
     n_valid_per_row = (sampled != PLACEHOLDER_TOKEN_ID).sum(dim=1).tolist()
+    sampled_list = sampled.tolist()
     draft_ids_list = draft_token_ids.tolist()
 
     rejected_events: list[tuple[int, int, int, int]] = []  # (row, num_accepted, rejected_token, flat_draft_row)
@@ -305,8 +343,12 @@ def _record_verify_events_impl(
     for row in range(batch_size):
         n_draft = int(num_draft_per_req[row])
         row_end = row_start + n_draft
-        n_valid = int(n_valid_per_row[row])
-        n_accepted = max(min(n_valid - 1, n_draft), 0)
+        n_accepted = compute_dflash_num_accepted(
+            n_valid=int(n_valid_per_row[row]),
+            n_draft=n_draft,
+            sampled_row=sampled_list[row],
+            draft_row=draft_ids_list[row_start:row_end],
+        )
         accepted_counts.append(n_accepted)
         if 0 < n_draft and n_accepted < n_draft:
             rejected_token = int(draft_ids_list[row_start + n_accepted])
@@ -328,12 +370,13 @@ def _record_verify_events_impl(
             row0 = sampled[0].detach().cpu().tolist()
             draft0 = draft_ids_list[: int(num_draft_per_req[0]) if num_draft_per_req else 8]
             logger.info(
-                "OPD_PATCH_DEBUG call=%d req0=%s num_draft=%s n_valid=%s sampled_row0=%s draft_row0=%s "
+                "OPD_PATCH_DEBUG call=%d req0=%s num_draft=%s n_valid=%s accepted=%s sampled_row0=%s draft_row0=%s "
                 "rejected_events=%s logits_absmax=%.4f allzero=%s",
                 _dbg["calls"],
                 req_ids[0],
                 num_draft_per_req,
                 n_valid_per_row,
+                accepted_counts,
                 row0,
                 draft0,
                 rejected_events[:4],
