@@ -985,10 +985,28 @@ class vLLMHttpServer:
         return ["kv_cache", "weights"]
 
     async def _sleep_hybrid(self):
-        """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
-        # Don't use engine.sleep(level=2) here
-        # lora only update adapter weights, so set sleep level to 1
-        if self.lora_as_adapter:
+        """HYBRID sleep: pick a level that preserves weights the wake will NOT re-stream.
+
+        vLLM sleep semantics:
+          - level=1 offloads weights to host RAM and restores them on wake_up;
+          - level=2 frees the weight memory *without* a host copy, so the
+            content after wake_up is uninitialized until the caller re-syncs it.
+
+        Two cases must keep their resident weights across sleep/wake because the
+        subsequent ``update_weights`` only re-streams a subset:
+          - LoRA-as-adapter: only the adapter is synced, base weights stay.
+          - Composed DFLASH/EAGLE3 OPD student: only the trainable ``draft``
+            subtree is streamed (``dflash_draft_only``); the frozen *target*
+            weights are loaded once at engine init and never sent again.
+
+        Using level=2 for the composed student drops the frozen target after the
+        first sleep, so the target runs on uninitialized memory: its logits blow
+        up (``logits_absmax=inf``), argmax collapses to token 0, every draft
+        token is trivially "accepted" (no rejection anchors), OPD loss is
+        identically 0 and generation degenerates (responses fill to max_tokens
+        and never emit EOS). Keep such engines at level=1.
+        """
+        if self.lora_as_adapter or self.is_composed_dflash_student:
             sleep_level = 1
         else:
             sleep_level = 2

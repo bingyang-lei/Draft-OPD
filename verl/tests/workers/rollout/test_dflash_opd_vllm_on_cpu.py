@@ -13,7 +13,11 @@
 # limitations under the License.
 """CPU tests for the vLLM DFlash OPD helpers (no engine required)."""
 
+import asyncio
 import math
+from types import SimpleNamespace
+
+import pytest
 
 from verl.utils.vllm.dflash_opd_patch import DFlashOpdMetadataRegistry
 from verl.workers.rollout.vllm_rollout.opd_utils import (
@@ -21,6 +25,53 @@ from verl.workers.rollout.vllm_rollout.opd_utils import (
     iter_opd_draft_weights,
     map_opd_draft_weight_name,
 )
+
+
+class _FakeEngine:
+    """Records the sleep level requested via collective_rpc."""
+
+    def __init__(self):
+        self.sleep_level = None
+
+    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        if method == "sleep":
+            self.sleep_level = (kwargs or {}).get("level")
+
+    async def reset_encoder_cache(self):
+        pass
+
+
+def _make_hybrid_server(*, is_composed_dflash_student: bool, lora_rank: int = 0, lora_merge: bool = False):
+    """Build a bare vLLMHttpServer for exercising ``_sleep_hybrid`` only.
+
+    Bypasses ``__init__`` (which spins up config/ray plumbing) and injects the
+    handful of attributes ``_sleep_hybrid`` reads.
+    """
+    vllm_async_server = pytest.importorskip("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    server = vllm_async_server.vLLMHttpServer.__new__(vllm_async_server.vLLMHttpServer)
+    server.model_config = SimpleNamespace(lora_rank=lora_rank, lora={"rank": lora_rank, "merge": lora_merge})
+    server.is_composed_dflash_student = is_composed_dflash_student
+    server.engine = _FakeEngine()
+    return server
+
+
+def test_sleep_hybrid_uses_level1_for_composed_dflash_student():
+    """The frozen target is never re-synced after wake, so it must survive sleep."""
+    server = _make_hybrid_server(is_composed_dflash_student=True)
+    asyncio.run(server._sleep_hybrid())
+    assert server.engine.sleep_level == 1
+
+
+def test_sleep_hybrid_uses_level1_for_lora_adapter():
+    server = _make_hybrid_server(is_composed_dflash_student=False, lora_rank=8)
+    asyncio.run(server._sleep_hybrid())
+    assert server.engine.sleep_level == 1
+
+
+def test_sleep_hybrid_uses_level2_for_plain_full_weight_engine():
+    server = _make_hybrid_server(is_composed_dflash_student=False)
+    asyncio.run(server._sleep_hybrid())
+    assert server.engine.sleep_level == 2
 
 
 def test_map_opd_draft_weight_name_strips_wrapper_prefixes():
