@@ -64,10 +64,13 @@ ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.4}
 # 2-5x generation time. Set ROLLOUT_ENFORCE_EAGER=True only for bring-up or
 # debugging to remove graph-mode failure modes.
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
-# vllm-ascend supports sleep/wake (worker.sleep/wake_up), so HYBRID colocate
-# works with the default free_cache_engine=True. If sleep proves unstable on
-# your stack, set ROLLOUT_FREE_CACHE_ENGINE=False to keep weights resident.
-ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-True}
+# Keep rollout weights resident by default: skipping the HYBRID sleep/wake
+# cycle avoids offloading and restoring the full weight set between NPU and
+# host RAM on every step (two full copies per engine per step, plus the KV
+# rebuild). Set ROLLOUT_FREE_CACHE_ENGINE=True if update_actor OOMs on
+# activation memory (sleep level=1 still preserves the frozen DFlash target
+# weights correctly, it just pays the copy cost).
+ROLLOUT_FREE_CACHE_ENGINE=${ROLLOUT_FREE_CACHE_ENGINE:-False}
 ENABLE_THINKING=${ENABLE_THINKING:-False}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your DFlash draft model path.
 NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-7} # DFlash block size K.
