@@ -68,7 +68,10 @@ From the repository root, run:
 bash install.sh
 ```
 
-`install.sh` installs `verl` (**no extras** — the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack) and, on NPU, skips engines that are already installed (e.g. pre-provisioned containers); in a bare environment it also installs `vllm` / `vllm-ascend` from the submodules. The NPU + vLLM trainer entrypoint is `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
+Two entry points:
+
+- Standard (SGLang) path: `bash install.sh` — installs the editable `sglang-dflash` and `verl` packages and their dependencies.
+- NPU + vLLM path (e.g. pre-provisioned NPU containers): `bash install_npu.sh` — installs `verl` (**no extras** — the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack), skips engines that are already installed, and in a bare environment also installs `vllm` / `vllm-ascend` from the submodules. The trainer entrypoint is `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
 
 ## Quick Start
 
