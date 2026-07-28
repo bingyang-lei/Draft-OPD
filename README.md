@@ -54,24 +54,15 @@ The script launches DFlash on-policy distillation through `verl`. It wraps `run_
 
 ## Install
 
-Clone with submodules (`vllm/` and `vllm-ascend/` are pinned to the upstream commits the vLLM rollout path is tested against):
-
-```bash
-git clone --recursive git@github.com:Simplified-Reasoning/Draft-OPD.git
-# or, if you already cloned without --recursive:
-git submodule update --init --recursive
-```
-
 From the repository root, run:
 
 ```bash
 bash install.sh
 ```
 
-Two entry points:
+This installs the editable `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
 
-- Standard (SGLang) path: `bash install.sh` — installs the editable `sglang-dflash` and `verl` packages and their dependencies.
-- NPU + vLLM path (e.g. pre-provisioned NPU containers): `bash install_npu.sh` — installs `verl` (**no extras** — the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack), skips engines that are already installed, and in a bare environment also installs `vllm` / `vllm-ascend` from the submodules. The trainer entrypoint is `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
+The vLLM rollout path additionally uses the `vllm/` and `vllm-ascend/` git submodules (pinned to the upstream commits it is tested against): clone with `git clone --recursive`, or run `git submodule update --init --recursive` in an existing clone. On NPU, run `bash install_npu.sh` instead: it installs `verl` without extras (the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack) and skips engines that are already installed. Trainer entrypoint: `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
 
 ## Quick Start
 
