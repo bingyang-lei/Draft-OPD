@@ -22,12 +22,6 @@ Looking for ways to dive in? Check out these issues:
 
 - **Python-only**: install verl via `pip install -e .[test,vllm]` or `pip install -e .[test,sglang]` and iterate quickly. For full dependency setup, check out the verl [installation doc](https://verl.readthedocs.io/en/latest/start/install.html).
 
-  > **Ascend NPU note**: do NOT install the `[vllm]` or `[sglang]` extras on an
-  > NPU / vllm-ascend v0.21 stack — they pin `vllm<=0.12.0` and
-  > `sglang==0.5.8` + `torch==2.9.1` and would downgrade/break the pre-installed
-  > engines. Use plain `pip install -e .` (optionally with `[test]`) and let the
-  > container-provided `vllm` / `vllm-ascend` satisfy the engine imports.
-
 ## Code Linting and Formatting
 
 We rely on pre-commit to keep our code consistent. To set it up:
