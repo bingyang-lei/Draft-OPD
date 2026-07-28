@@ -54,7 +54,7 @@ The script launches DFlash on-policy distillation through `verl`. It wraps `run_
 
 ## Install
 
-Clone with submodules (the `vllm/` and `vllm-ascend/` directories are git submodules pinned to tested commits):
+Clone with submodules (`vllm/` and `vllm-ascend/` are pinned to the upstream commits the vLLM rollout path is tested against):
 
 ```bash
 git clone --recursive git@github.com:curnane-lab/Draft-OPD.git
@@ -68,15 +68,7 @@ From the repository root, run:
 bash install.sh
 ```
 
-`install.sh` wraps `install_npu.sh`, which **auto-detects already-installed components and skips them** (`vllm` / `vllm-ascend` / `triton-ascend` / `sglang` / `verl`). In a pre-provisioned NPU container this only installs `verl`; in a bare environment it also installs the engines from the submodules. The SGLang engine is skipped by default (the vLLM path does not use it); opt in with `INSTALL_SGLANG_DFLASH=1`, and force engine reinstall with `FORCE_INSTALL_ENGINES=1`.
-
-> **Note**: `verl` is always installed **without extras**. `verl[vllm]` pins `vllm<=0.12.0` and `verl[sglang]` pins `torch==2.9.1` — both break an NPU / vllm-ascend v0.21 stack.
-
-### Ascend NPU notes
-
-- The vLLM rollout path requires a matching CANN / torch / torch-npu stack for the pinned vllm-ascend version (see `vllm-ascend/docs/source/installation.md`), plus `triton-ascend` (already listed in `verl/requirements-npu.txt`). `install_npu.sh` checks and warns but never auto-installs torch/torch_npu.
-- `install.sh` builds vLLM with `VLLM_TARGET_DEVICE=empty` when the engine is not already present; NPU kernels are provided by `vllm-ascend`.
-- To run the NPU + vLLM variant of the OPD trainer, use `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh` (the SGLang reference path remains `run_qwen_gsm8k_forward-ins.sh`).
+`install.sh` installs `verl` (**no extras** — the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack) and, on NPU, skips engines that are already installed (e.g. pre-provisioned containers); in a bare environment it also installs `vllm` / `vllm-ascend` from the submodules. The NPU + vLLM trainer entrypoint is `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
 
 ## Quick Start
 
