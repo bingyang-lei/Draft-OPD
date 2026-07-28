@@ -57,7 +57,7 @@ The script launches DFlash on-policy distillation through `verl`. It wraps `run_
 Clone with submodules (`vllm/` and `vllm-ascend/` are pinned to the upstream commits the vLLM rollout path is tested against):
 
 ```bash
-git clone --recursive git@github.com:curnane-lab/Draft-OPD.git
+git clone --recursive git@github.com:Simplified-Reasoning/Draft-OPD.git
 # or, if you already cloned without --recursive:
 git submodule update --init --recursive
 ```
