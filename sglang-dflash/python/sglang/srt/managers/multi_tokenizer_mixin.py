@@ -109,7 +109,8 @@ def _extract_field_by_index(
         for k, v in field.items():
             if len(v) <= index:
                 new_field[k] = None
-            new_field[k] = v[index]
+            else:
+                new_field[k] = v[index]
         return new_field
 
     if check_length:

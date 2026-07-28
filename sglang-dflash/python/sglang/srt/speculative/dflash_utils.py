@@ -10,9 +10,11 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+DFLASH_REQUEST_SEEDED_VERIFY_VERSION = 1
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -718,9 +720,13 @@ def compute_dflash_candidate_logprobs(
 
     if use_sampling_distribution:
         if sampling_info is None:
-            raise ValueError("sampling_info is required when use_sampling_distribution=True.")
+            raise ValueError(
+                "sampling_info is required when use_sampling_distribution=True."
+            )
         if top_k_renorm_prob is None or top_p_renorm_prob is None:
-            raise RuntimeError("DFLASH sampling logprob computation is unavailable on this build/device.")
+            raise RuntimeError(
+                "DFLASH sampling logprob computation is unavailable on this build/device."
+            )
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, draft_token_num, dim=0
         )
@@ -747,6 +753,79 @@ def compute_dflash_candidate_logprobs(
         .gather(dim=-1, index=candidate_token_ids.unsqueeze(-1))
         .squeeze(-1)
     )
+
+
+def _dflash_hash_to_uniform(hash_values: torch.Tensor) -> torch.Tensor:
+    """Convert uint32 hashes to float32 values in torch.rand's [0, 1) range."""
+    # Conversion through float64 preserves all uint32 values. Clamp after the
+    # float32 cast because (2**32 - 1) / 2**32 rounds to 1.0 in float32.
+    return (
+        (hash_values.to(torch.float64) / float(1 << 32))
+        .to(torch.float32)
+        .clamp_(max=0.9999999403953552)
+    )
+
+
+def make_dflash_verify_uniform_samples(
+    *,
+    sampling_info: Any,
+    positions: torch.Tensor,
+    draft_token_num: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Build request-scoped random draws for deterministic DFlash verification.
+
+    SGLang deterministic inference keys ordinary target sampling by the request's
+    ``sampling_seed`` and the absolute token position. DFlash verification must
+    follow the same ownership model: using the process-global CUDA RNG makes a
+    request's result depend on its batch peers and on scheduler/resume timing.
+
+    The two streams below intentionally use distinct MurmurHash columns. Acceptance
+    draws are keyed by every absolute verify position, while the final-sampling draw
+    is keyed by the block's first absolute position. The latter is sufficient because
+    there is exactly one final sample per verify block.
+
+    Returns ``(None, None)`` when deterministic inference is disabled so callers
+    retain the existing stochastic ``torch.rand`` behavior.
+    """
+    sampling_seed = getattr(sampling_info, "sampling_seed", None)
+    if sampling_seed is None:
+        return None, None
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+    if sampling_seed.ndim != 1:
+        raise ValueError(
+            "sampling_seed must be one-dimensional, "
+            f"got shape={tuple(sampling_seed.shape)}."
+        )
+
+    bs = int(sampling_seed.numel())
+    expected_positions = bs * int(draft_token_num)
+    if positions.ndim != 1 or positions.numel() != expected_positions:
+        raise ValueError(
+            "DFLASH verify positions shape mismatch. "
+            f"Expected ({expected_positions},), got {tuple(positions.shape)}."
+        )
+    if positions.device != sampling_seed.device:
+        positions = positions.to(device=sampling_seed.device, non_blocking=True)
+
+    sampling_seed = sampling_seed.contiguous()
+    positions_2d = positions.reshape(bs, int(draft_token_num))
+    expanded_seed = sampling_seed.repeat_interleave(int(draft_token_num))
+    acceptance_hash = murmur_hash32(
+        expanded_seed,
+        positions_2d.reshape(-1),
+        torch.zeros((1,), dtype=torch.int64, device=sampling_seed.device),
+    )
+    final_hash = murmur_hash32(
+        sampling_seed,
+        positions_2d[:, 0].contiguous(),
+        torch.ones((1,), dtype=torch.int64, device=sampling_seed.device),
+    )
+    uniform_samples = _dflash_hash_to_uniform(
+        acceptance_hash.reshape(bs, int(draft_token_num))
+    )
+    uniform_samples_for_final_sampling = _dflash_hash_to_uniform(final_hash.reshape(bs))
+    return uniform_samples, uniform_samples_for_final_sampling
 
 
 def compute_dflash_sampling_accept_len_and_bonus(

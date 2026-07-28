@@ -21,6 +21,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_candidate_logprobs,
     compute_dflash_sampling_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
+    make_dflash_verify_uniform_samples,
 )
 from sglang.srt.speculative.dflash_worker import DFlashWorker
 from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
@@ -417,12 +418,22 @@ class DFlashWorkerV2(DFlashWorker):
             and is_dflash_sampling_verify_available()
         )
         if use_sampling_distribution:
+            (
+                uniform_samples,
+                uniform_samples_for_final_sampling,
+            ) = make_dflash_verify_uniform_samples(
+                sampling_info=sampling_info,
+                positions=verify_input.positions,
+                draft_token_num=int(self.block_size),
+            )
             accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(

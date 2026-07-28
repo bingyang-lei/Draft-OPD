@@ -9,14 +9,15 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.managers.customized_info_utils import (
+    append_batched_customized_info,
+    append_dflash_reject_token_mask,
+    append_dflash_rejected_draft_metadata,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-)
-from sglang.srt.managers.customized_info_utils import (
-    append_dflash_reject_token_mask,
-    append_dflash_rejected_draft_metadata,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -1092,11 +1093,12 @@ class SchedulerOutputProcessorMixin:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
 
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in customized_info:
-                            customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                append_batched_customized_info(
+                    customized_info,
+                    req.customized_info,
+                    output_index=len(rids) - 1,
+                    send_token_offset=send_token_offset,
+                )
 
             if (
                 req.finished()

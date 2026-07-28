@@ -1,6 +1,6 @@
 import importlib.util
-from pathlib import Path
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 _UTILS_PATH = (
@@ -18,10 +18,51 @@ _SPEC.loader.exec_module(_UTILS)
 
 append_dflash_reject_token_mask = _UTILS.append_dflash_reject_token_mask
 append_dflash_rejected_draft_metadata = _UTILS.append_dflash_rejected_draft_metadata
+append_batched_customized_info = _UTILS.append_batched_customized_info
 update_customized_info_meta = _UTILS.update_customized_info_meta
 
 
 class TestDFlashCustomizedInfo(unittest.TestCase):
+    def test_batched_customized_info_preserves_sparse_request_positions(self):
+        batched_info = {}
+
+        append_batched_customized_info(
+            batched_info,
+            {"first_only": [10, 11]},
+            output_index=0,
+            send_token_offset=1,
+        )
+        append_batched_customized_info(
+            batched_info,
+            None,
+            output_index=1,
+            send_token_offset=0,
+        )
+        append_batched_customized_info(
+            batched_info,
+            {"last_only": [20, 21]},
+            output_index=2,
+            send_token_offset=1,
+        )
+
+        self.assertEqual(batched_info["first_only"], [[11], None, None])
+        self.assertEqual(batched_info["last_only"], [None, None, [21]])
+
+    def test_tokenizer_skips_aligned_placeholder_without_cross_request_leak(self):
+        state = SimpleNamespace(customized_info={})
+        meta_info = {}
+
+        update_customized_info_meta(
+            meta_info=meta_info,
+            state=state,
+            recv_customized_info={"first_only": [[11], None, None]},
+            recv_index=1,
+            use_stream_output=False,
+        )
+
+        self.assertEqual(meta_info, {})
+        self.assertEqual(state.customized_info, {})
+
     def test_dflash_mask_pads_prefill_token_before_verify_commit(self):
         req = SimpleNamespace(output_ids=[101], customized_info=None)
 
@@ -85,7 +126,9 @@ class TestDFlashCustomizedInfo(unittest.TestCase):
         update_customized_info_meta(
             meta_info=meta_info,
             state=state,
-            recv_customized_info={key: [value] for key, value in req.customized_info.items()},
+            recv_customized_info={
+                key: [value] for key, value in req.customized_info.items()
+            },
             recv_index=0,
             use_stream_output=False,
         )
@@ -93,7 +136,9 @@ class TestDFlashCustomizedInfo(unittest.TestCase):
         self.assertEqual(meta_info["dflash_rejected_draft_anchor_indices"], [0, 0])
         self.assertEqual(meta_info["dflash_rejected_draft_offsets"], [2, 3])
         self.assertEqual(meta_info["dflash_rejected_draft_token_ids"], [202, 203])
-        self.assertEqual(meta_info["dflash_rejected_draft_teacher_logprobs"], [-0.2, -0.3])
+        self.assertEqual(
+            meta_info["dflash_rejected_draft_teacher_logprobs"], [-0.2, -0.3]
+        )
 
     def test_dflash_rejected_draft_all_accepted_stores_no_suffix(self):
         req = SimpleNamespace(output_ids=[101, 102, 103], customized_info=None)
@@ -178,7 +223,9 @@ class TestDFlashCustomizedInfo(unittest.TestCase):
         )
 
         self.assertNotIn("dflash_reject_token_mask", meta_info)
-        self.assertEqual(state.customized_info["dflash_reject_token_mask"], [False, True])
+        self.assertEqual(
+            state.customized_info["dflash_reject_token_mask"], [False, True]
+        )
 
         meta_info = {}
         update_customized_info_meta(

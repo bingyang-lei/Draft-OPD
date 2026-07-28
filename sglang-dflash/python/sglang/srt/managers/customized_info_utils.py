@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterable as IterableABC
 from typing import Any, Dict, Iterable, List, Optional
 
-
 DFLASH_REJECTED_DRAFT_META_KEYS = frozenset(
     {
         "dflash_rejected_draft_anchor_indices",
@@ -23,7 +22,9 @@ def _as_list(value: Any) -> list[Any]:
         return value
     if isinstance(value, tuple):
         return list(value)
-    if isinstance(value, IterableABC) and not isinstance(value, (str, bytes, bytearray, dict)):
+    if isinstance(value, IterableABC) and not isinstance(
+        value, (str, bytes, bytearray, dict)
+    ):
         return list(value)
     return [value]
 
@@ -61,6 +62,36 @@ def extend_customized_info_chunk(
         values.append(chunk)
 
 
+def append_batched_customized_info(
+    batched_info: Dict[str, List[Any]],
+    request_info: Optional[Dict[str, List[Any]]],
+    *,
+    output_index: int,
+    send_token_offset: int,
+) -> None:
+    """Append one request while preserving batch-index alignment for every key.
+
+    Customized metadata is optional per request. Compacting only requests that
+    carry a given key shifts later values to the wrong request and eventually
+    makes the tokenizer index beyond the shortened list.
+    """
+    for key, values in batched_info.items():
+        if len(values) != output_index:
+            raise RuntimeError(
+                f"Customized info key {key!r} is not batch aligned: "
+                f"len={len(values)}, expected={output_index}"
+            )
+        values.append(None)
+
+    if not request_info:
+        return
+
+    for key, values in request_info.items():
+        if key not in batched_info:
+            batched_info[key] = [None] * (output_index + 1)
+        batched_info[key][output_index] = values[send_token_offset:]
+
+
 def update_customized_info_meta(
     *,
     meta_info: Dict[str, Any],
@@ -72,6 +103,11 @@ def update_customized_info_meta(
 ) -> None:
     if recv_customized_info:
         for key, value_by_req in recv_customized_info.items():
+            if recv_index >= len(value_by_req):
+                raise RuntimeError(
+                    f"Customized info key {key!r} has {len(value_by_req)} entries "
+                    f"but tokenizer requested batch index {recv_index}"
+                )
             chunk = value_by_req[recv_index]
             if use_stream_output:
                 if key in DFLASH_REJECTED_DRAFT_META_KEYS:

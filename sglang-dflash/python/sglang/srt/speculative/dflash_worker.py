@@ -97,6 +97,7 @@ class DFlashWorker:
             None if self.use_compact_draft_cache else target_req_to_token_pool
         )
         draft_server_args = deepcopy(server_args)
+        draft_server_args.enable_lora = False
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4")

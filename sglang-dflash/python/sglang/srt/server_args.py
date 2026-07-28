@@ -5981,9 +5981,9 @@ class ServerArgs:
                 )
 
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
+            if self.speculative_algorithm not in ["NGRAM", "DFLASH", None]:
                 raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
+                    "Currently LoRA is only compatible with NGRAM and DFLASH speculative decoding."
                 )
 
             # Parse lora_paths

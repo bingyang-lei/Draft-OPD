@@ -24,6 +24,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_candidate_logprobs,
     compute_dflash_sampling_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
+    make_dflash_verify_uniform_samples,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -357,6 +358,14 @@ class DFlashVerifyInput(SpecInput):
         )
         if use_sampling_distribution:
             top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
+            (
+                uniform_samples,
+                uniform_samples_for_final_sampling,
+            ) = make_dflash_verify_uniform_samples(
+                sampling_info=sampling_info,
+                positions=self.positions,
+                draft_token_num=self.draft_token_num,
+            )
             accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
@@ -367,6 +376,8 @@ class DFlashVerifyInput(SpecInput):
                     if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
                     else None
                 ),
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
             )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
