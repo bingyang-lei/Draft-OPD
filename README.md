@@ -38,8 +38,8 @@ This repository contains the public training and evaluation code for Draft-OPD. 
 | --- | --- |
 | `verl/` | Training code and the public OPD DFlash training entrypoint. |
 | `sglang-dflash/` | DFlash / SGLang runtime code used by training and evaluation. |
-| `vllm/` | vLLM submodule ([curnane-lab/vllm](https://github.com/curnane-lab/vllm), `domino_npu_v0.21.0`), frontend of the vLLM rollout path. |
-| `vllm-ascend/` | vLLM-Ascend submodule ([curnane-lab/vllm-ascend](https://github.com/curnane-lab/vllm-ascend), `domino_npu_v0.21.0rc1`), provides the `dflash` speculative method on Ascend NPU. |
+| `vllm/` | vLLM submodule ([vllm-project/vllm](https://github.com/vllm-project/vllm), `v0.21.0`), frontend of the vLLM rollout path. |
+| `vllm-ascend/` | vLLM-Ascend submodule ([vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend), `releases/v0.21.0rc`), provides the `dflash` speculative method on Ascend NPU. |
 | `diffusion/` | Draft-OPD evaluation utilities, with the main benchmark workflow in `diffusion/dflash/`. |
 
 ## Training Entry Point
