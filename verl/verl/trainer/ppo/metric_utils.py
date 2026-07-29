@@ -109,6 +109,7 @@ def compute_dflash_rollout_metrics(batch: DataProto) -> dict[str, Any]:
         ("dflash_reject_token_mask_aligned_len", "opd/rollout/reject_mask_aligned_len"),
         ("dflash_reject_token_count", "opd/rollout/reject_token_count"),
         ("dflash_non_reject_token_count", "opd/rollout/non_reject_token_count"),
+        ("dflash_accept_length", "opd/rollout/accept_length"),
     ):
         values = _numeric_non_tensor_values(batch, key)
         if values is None:

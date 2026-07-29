@@ -156,6 +156,11 @@ def build_dflash_extra_fields(metadata: Optional[dict[str, Any]], response_len: 
     extra_fields["dflash_reject_token_count"] = len(anchor_indices)
     extra_fields["dflash_non_reject_token_count"] = max(response_len - len(anchor_indices), 0)
     extra_fields["dflash_empty_reject_token_indices"] = int(response_len > 0 and len(anchor_indices) == 0)
+    num_verify_steps = int(metadata.get("_num_verify_steps", 0) or 0)
+    # Mean tokens advanced per verify step (accepted prefix + bonus token),
+    # i.e. the spec-decode acceptance length; rises as the draft distills
+    # toward the target. Matches sglang's spec_accept_length semantics.
+    extra_fields["dflash_accept_length"] = (response_len / num_verify_steps) if num_verify_steps > 0 else 0.0
 
     return extra_fields
 
@@ -179,6 +184,7 @@ def empty_dflash_extra_fields(response_len: int) -> dict[str, Any]:
         "dflash_reject_token_count": 0,
         "dflash_non_reject_token_count": max(response_len, 0),
         "dflash_empty_reject_token_indices": int(response_len > 0),
+        "dflash_accept_length": 0.0,
     }
 
 
