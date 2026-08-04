@@ -168,7 +168,49 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+
+        # 4. OPD: patch the rejection-sampler seam so DFlash verify metadata
+        # (reject positions, teacher logprobs) is recorded per request.
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
+            from verl.utils.vllm.dflash_opd_patch import apply_dflash_opd_patches
+
+            try:
+                apply_dflash_opd_patches()
+            except Exception:  # noqa: BLE001 — never kill the engine worker
+                logger.exception("dflash_opd_patch: apply_dflash_opd_patches raised unexpectedly")
+
         return instance
+
+    def get_dflash_opd_metadata(self, request_id: str):
+        """Pop the recorded DFlash OPD reject metadata for a finished request.
+
+        Invoked via collective_rpc from the rollout frontend after a request
+        completes. Returns None when OPD recording is not active or the
+        request produced no speculative-verification events.
+        """
+        from verl.utils.vllm.dflash_opd_patch import get_dflash_opd_metadata as _get
+
+        return _get(request_id)
+
+    def gc_dflash_opd_metadata(self) -> int:
+        """Drop stale DFlash OPD registry entries (aborted requests)."""
+        from verl.utils.vllm.dflash_opd_patch import gc_dflash_opd_metadata as _gc
+
+        return _gc()
+
+    def probe_dflash_opd(self) -> dict:
+        """Startup probe: report whether the OPD reject-metadata pipeline is live.
+
+        Used by the rollout frontend to fail fast at engine startup instead of
+        discovering a broken chain at the first training step.
+        """
+        runner = self.model_runner
+        spec_cfg = getattr(runner, "speculative_config", None)
+        return {
+            "patch_applied": bool(getattr(type(runner), "_dflash_opd_patched", False)),
+            "has_drafter": getattr(runner, "drafter", None) is not None,
+            "spec_method": getattr(spec_cfg, "method", None),
+        }
 
     def monkey_patch_model(self, vocab_size: int):
         # patch compute_logits to avoid sampling OOV token
@@ -176,14 +218,28 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
-        """Update the weights of the rollout model."""
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        draft_model_only: bool = False,
+    ):
+        """Update the weights of the rollout model.
+
+        When ``draft_model_only`` is True (composed DFLASH/EAGLE3 OPD student),
+        the received tensors are loaded into the speculative draft model
+        (``model_runner.drafter.model``) instead of the frozen target model.
+        """
         from vllm.platforms import current_platform
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
+
+        if draft_model_only and peft_config is not None:
+            raise ValueError("draft_model_only weight sync is not compatible with LoRA adapter sync.")
 
         # In async mode, make sure the old lora is removed before adding the new one
         if peft_config and base_sync_done:
@@ -204,7 +260,7 @@ class vLLMColocateWorkerExtension:
 
             prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
             logger.info("ModelOpt: prepare_modelopt_for_weight_reload completed")
-        elif use_standard_weight_load:
+        elif use_standard_weight_load and not draft_model_only:
             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
@@ -216,7 +272,10 @@ class vLLMColocateWorkerExtension:
         )
         receiver.receive_weights(
             on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
+                weights,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                draft_model_only=draft_model_only,
             )
         )
 
@@ -231,7 +290,7 @@ class vLLMColocateWorkerExtension:
 
             modelopt_process_weights_after_loading(self.model_runner.model)
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
-        elif use_standard_weight_load:
+        elif use_standard_weight_load and not draft_model_only:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
@@ -239,7 +298,13 @@ class vLLMColocateWorkerExtension:
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        draft_model_only: bool = False,
+    ):
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -259,9 +324,31 @@ class vLLMColocateWorkerExtension:
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+            elif draft_model_only:
+                draft_model = self._get_draft_model()
+                # Note: DFlashQwen3ForCausalLM.load_weights returns None (it
+                # delegates to an inner AutoWeightsLoader), so count inputs.
+                draft_model.load_weights(weights)
+                logger.info(f"Draft model weights loaded (async), loaded_params: {len(weights)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
+
+    def _get_draft_model(self):
+        """Return the speculative draft model (e.g. DFlash) held by the proposer."""
+        drafter = getattr(self.model_runner, "drafter", None)
+        if drafter is None:
+            raise RuntimeError(
+                "draft_model_only weight sync requested but this model runner has no drafter. "
+                "Start the server with a speculative_config (method=dflash/eagle/...) first."
+            )
+        draft_model = getattr(drafter, "model", None)
+        if draft_model is None or not hasattr(draft_model, "load_weights"):
+            raise RuntimeError(
+                f"Drafter {type(drafter).__name__} does not expose a loadable draft model "
+                "(expected a `.model` attribute with `load_weights`)."
+            )
+        return draft_model
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

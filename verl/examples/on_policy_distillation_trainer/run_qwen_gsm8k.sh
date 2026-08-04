@@ -27,7 +27,7 @@ trap run_gpu_stress_test_on_exit EXIT
 ############################ Quick Config ############################
 cd "$REPO_ROOT"
 # source /path/to/miniconda3/bin/activate verl
-ROLLOUT_NAME="sglang" # sglang or vllm
+ROLLOUT_NAME="${ROLLOUT_NAME:-sglang}" # sglang or vllm
 
 MAIN_MODEL_PATH=${MAIN_MODEL_PATH:-""} # your model path.
 
@@ -86,7 +86,7 @@ fi
 STUDENT_MICRO_BATCH_SIZE_PER_GPU=2
 STUDENT_MAX_TOKEN_LEN_PER_GPU=$(( STUDENT_MICRO_BATCH_SIZE_PER_GPU * (MAX_PROMPT + MAX_RESPONSE_LENGTH) ))
 USE_DYNAMIC_BSZ=True
-DFLASH_ATTENTION_IMPL="flex_attention"
+DFLASH_ATTENTION_IMPL=${DFLASH_ATTENTION_IMPL:-"flex_attention"}
 DFLASH_LM_HEAD_CHUNK_SIZE=512
 DFLASH_RESPONSE_ANCHOR_STRIDE=1 # 控制 response 里用于构造 DFLASH anchor/segment 的密度, 1代表全部计算，2代表隔一个计算一个
 

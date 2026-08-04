@@ -798,6 +798,8 @@ class RayPPOTrainer:
                         "sglang_completion_tokens",
                         "sglang_spec_verify_ct",
                         "sglang_spec_accept_token_num",
+                        "dflash_accept_length",
+                        "dflash_num_verify_steps",
                     ):
                         value = test_output.non_tensor_batch.get(key)
                         if value is not None:
@@ -815,6 +817,20 @@ class RayPPOTrainer:
             accept_length = compute_sglang_spec_accept_length(merged_output)
             if accept_length is not None:
                 metric_dict[f"test_rollout/{benchmark_name}/sglang_spec_accept_length"] = accept_length
+
+            # vLLM path parity: token-weighted accept length per benchmark,
+            # sum(response tokens) / sum(verify steps), same semantics as the
+            # sglang panel above.
+            dflash_al = accept_length_fields.get("dflash_accept_length")
+            dflash_vs = accept_length_fields.get("dflash_num_verify_steps")
+            if dflash_al and dflash_vs:
+                al = np.concatenate(dflash_al).astype(np.float64)
+                vs = np.concatenate(dflash_vs).astype(np.float64)
+                total_vs = float(vs.sum())
+                if total_vs > 0:
+                    metric_dict[f"test_rollout/{benchmark_name}/vllm_spec_accept_length"] = float(
+                        (al * vs).sum() / total_vs
+                    )
 
         return metric_dict
 

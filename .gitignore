@@ -1,9 +1,13 @@
 # Publish only the selected public repository content from this workspace.
 /*
 !/.gitignore
+!/.gitmodules
 !/README.md
 !/install.sh
+!/install_npu.sh
 !/verl/
+!/vllm
+!/vllm-ascend
 !/sglang-dflash/
 !/diffusion/
 !/fig/
@@ -21,6 +25,7 @@
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
 !/verl/examples/on_policy_distillation_trainer/run_qwen-30b-a3b.sh
+!/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md
 /verl/my-purpose.md

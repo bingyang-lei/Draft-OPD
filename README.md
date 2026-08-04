@@ -38,6 +38,8 @@ This repository contains the public training and evaluation code for Draft-OPD. 
 | --- | --- |
 | `verl/` | Training code and the public OPD DFlash training entrypoint. |
 | `sglang-dflash/` | DFlash / SGLang runtime code used by training and evaluation. |
+| `vllm/` | vLLM submodule ([vllm-project/vllm](https://github.com/vllm-project/vllm), `v0.21.0`), frontend of the vLLM rollout path. |
+| `vllm-ascend/` | vLLM-Ascend submodule ([vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend), `releases/v0.21.0rc`), provides the `dflash` speculative method on Ascend NPU. |
 | `diffusion/` | Draft-OPD evaluation utilities, with the main benchmark workflow in `diffusion/dflash/`. |
 
 ## Training Entry Point
@@ -59,6 +61,8 @@ bash install.sh
 ```
 
 This installs the editable `sglang-dflash` and `verl` packages and their dependencies. No other manual setup is required.
+
+The vLLM rollout path additionally uses the `vllm/` and `vllm-ascend/` git submodules (pinned to the upstream commits it is tested against): clone with `git clone --recursive`, or run `git submodule update --init --recursive` in an existing clone. On NPU, run `bash install_npu.sh` instead: it installs `verl` without extras (the `verl[vllm]` / `verl[sglang]` pins would break the NPU vllm-ascend v0.21 stack) and skips engines that are already installed. Trainer entrypoint: `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_vllm_npu.sh`.
 
 ## Quick Start
 

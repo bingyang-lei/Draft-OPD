@@ -17,8 +17,17 @@ import inspect
 import json
 import logging
 import os
+import sys
 from pprint import pprint
 from typing import Any, Callable, Optional
+
+
+def _opd_dbg(msg: str, *args) -> None:
+    """OPD_PATCH_DEBUG output that bypasses the server logger (whose records
+    never surface through this actor's logging setup) and writes straight to
+    stderr so ray captures and forwards it."""
+    if os.environ.get("OPD_PATCH_DEBUG") == "1":
+        print("OPD_PATCH_DEBUG " + (msg % args if args else msg), file=sys.stderr, flush=True)
 
 import ray
 import vllm.entrypoints.cli.serve
@@ -77,6 +86,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _is_composed_dflash_student(model_config: HFModelConfig) -> bool:
+    return bool(
+        getattr(model_config.hf_config, "verl_composed_dflash_student", False)
+        or getattr(model_config.hf_config, "verl_composed_eagle3_student", False)
+    )
+
+
+def _config_node_get(node, key, default=None):
+    """Read a field from a config node that may be a dataclass, DictConfig, or plain dict.
+
+    hydra instantiate with _convert_="partial" leaves structured nodes that lost
+    their ``_target_`` (e.g. a rollout.mtp node overwritten by ++ CLI overrides)
+    as plain dicts, so dataclass-style attribute access is not guaranteed.
+    """
+    if node is None:
+        return default
+    if hasattr(node, "get"):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -127,6 +157,19 @@ class vLLMHttpServer:
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
+
+        self.is_composed_dflash_student = _is_composed_dflash_student(self.model_config)
+        if self.is_composed_dflash_student:
+            if self.config.load_format == "dummy":
+                logger.warning(
+                    "Composed OPD draft rollout trains only the draft model online, so vLLM target weights "
+                    "cannot be initialized with load_format=dummy. Set rollout load_format to auto."
+                )
+                self.config.load_format = "auto"
+            # Enable engine-side OPD reject-metadata recording in the vLLM
+            # workers (see verl.utils.vllm.dflash_opd_patch). Workers spawned
+            # after this point inherit the environment flag.
+            os.environ["VERL_DFLASH_OPD"] = "1"
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -284,12 +327,32 @@ class vLLMHttpServer:
                 args["served_model_name"] = served_model_name
 
         # mtp (None for diffusion models; only LLM models use speculative decoding)
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+        mtp_config = getattr(self.config, "mtp", None)
+        if _config_node_get(mtp_config, "enable", False) and _config_node_get(mtp_config, "enable_rollout", False):
             speculative_config = {
-                "method": self.config.mtp.method,
-                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
+                "method": _config_node_get(mtp_config, "method", "mtp"),
+                "num_speculative_tokens": _config_node_get(mtp_config, "num_speculative_tokens", 1),
             }
+            # Separate draft checkpoint (e.g. method="dflash" for OPD rollouts).
+            draft_model_path = _config_node_get(mtp_config, "draft_model_path", None)
+            if draft_model_path:
+                speculative_config["model"] = draft_model_path
             args["speculative_config"] = speculative_config
+
+        # DFlash OPD reject-metadata recording: activate whenever a dflash
+        # speculative config is in play — not only when the composed-student
+        # flag is set — so the metadata path works even if that flag does not
+        # propagate to this server process. Must happen before the engine
+        # (and its workers) are spawned so they inherit the env flag.
+        _spec_cfg = args.get("speculative_config") or {}
+        if self.is_composed_dflash_student or _spec_cfg.get("method") == "dflash":
+            os.environ["VERL_DFLASH_OPD"] = "1"
+        logger.info(
+            "DFLASH OPD rollout: composed_student=%s, speculative_config=%s, VERL_DFLASH_OPD=%s",
+            self.is_composed_dflash_student,
+            _spec_cfg or None,
+            os.environ.get("VERL_DFLASH_OPD"),
+        )
 
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
@@ -412,7 +475,34 @@ class vLLMHttpServer:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
+            await self._assert_dflash_opd_pipeline()
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+
+    async def _assert_dflash_opd_pipeline(self) -> None:
+        """Fail fast at startup when the OPD reject-metadata pipeline is broken.
+
+        Without this, a patch that failed to apply (or a missing drafter) only
+        surfaces at the first training step as 'reject metadata batch size
+        mismatch', after a full rollout phase.
+        """
+        results = await self.engine.collective_rpc("probe_dflash_opd")
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        probes = [r for r in results if r]
+        if not probes:
+            raise RuntimeError("DFLASH OPD probe returned no results from vLLM workers.")
+        not_patched = [r for r in probes if not r.get("patch_applied")]
+        no_drafter = [r for r in probes if not r.get("has_drafter")]
+        if not_patched or no_drafter:
+            raise RuntimeError(
+                "DFLASH OPD pipeline is not live on vLLM workers: "
+                f"patch_applied missing on {len(not_patched)}/{len(probes)} workers, "
+                f"drafter missing on {len(no_drafter)}/{len(probes)} workers, "
+                f"probes={probes}. Check that VERL_DFLASH_OPD=1 is set before engine spawn "
+                "and that speculative_config (method=dflash) is in effect."
+            )
+        logger.info("DFLASH OPD probe OK on %d worker(s): %s", len(probes), probes[0])
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -521,6 +611,19 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+        # Debug: sample a few finished responses (token ids) to spot
+        # degenerate generation (e.g. all-zero outputs). OPD_PATCH_DEBUG=1.
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_resp_dbg_count", 0) < 3:
+            self._opd_resp_dbg_count = getattr(self, "_opd_resp_dbg_count", 0) + 1
+            _opd_dbg(
+                "response sample n=%d req=%s len=%d first32=%s",
+                self._opd_resp_dbg_count,
+                request_id,
+                len(token_ids),
+                list(token_ids[:32]),
+            )
+        if os.environ.get("VERL_DFLASH_OPD", "0") == "1":
+            extra_fields.update(await self._collect_dflash_opd_fields(request_id, len(token_ids)))
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
@@ -551,6 +654,70 @@ class vLLMHttpServer:
             num_preempted=num_preempted,
             extra_fields=extra_fields,
         )
+
+    async def _collect_dflash_opd_fields(self, request_id: str, response_len: int) -> dict[str, Any]:
+        """Collect DFlash OPD reject metadata recorded by the engine workers.
+
+        The engine-side patch (verl.utils.vllm.dflash_opd_patch) records
+        speculative-verification reject events per request inside the worker
+        processes; retrieve them via collective_rpc and convert to the
+        ``dflash_*`` extra fields consumed by the agent loop / OPD losses.
+        """
+        from verl.utils.vllm.dflash_opd_patch import opd_enabled
+        from verl.workers.rollout.vllm_rollout.opd_utils import (
+            build_dflash_extra_fields,
+            empty_dflash_extra_fields,
+            merge_dflash_metadata,
+        )
+
+        if not opd_enabled():
+            return {}
+        try:
+            results = await self.engine.collective_rpc("get_dflash_opd_metadata", kwargs={"request_id": request_id})
+        except Exception:
+            logger.exception("failed to collect dflash opd metadata for request %s", request_id)
+            return {}
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        metadata = merge_dflash_metadata(iter(results))
+        # Debug: trace the collect side of the OPD metadata chain — whether
+        # pop() found events, how many anchors they carried, and how many
+        # survive the in-response filter. OPD_PATCH_DEBUG=1.
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg", 0) < 8:
+            self._opd_collect_dbg = getattr(self, "_opd_collect_dbg", 0) + 1
+            _opd_dbg(
+                "collect req=%s resp_len=%d metadata=%s",
+                request_id,
+                response_len,
+                None
+                if metadata is None
+                else {
+                    "anchors": len(metadata.get("rejected_draft_anchor_indices", [])),
+                    "verify_steps": metadata.get("_num_verify_steps"),
+                    "first_anchors": metadata.get("rejected_draft_anchor_indices", [])[:8],
+                },
+            )
+        if metadata is None:
+            if not getattr(self, "_opd_missing_logged", False):
+                self._opd_missing_logged = True
+                logger.info(
+                    "DFLASH OPD: no reject metadata returned for request %s "
+                    "(registry empty on workers — patch inactive or no verify events recorded)",
+                    request_id,
+                )
+            # SGLang parity: always emit the full key set, empty when no
+            # verify events were recorded for this request.
+            return empty_dflash_extra_fields(response_len)
+        fields = build_dflash_extra_fields(metadata, response_len)
+        if os.environ.get("OPD_PATCH_DEBUG") == "1" and getattr(self, "_opd_collect_dbg2", 0) < 8:
+            self._opd_collect_dbg2 = getattr(self, "_opd_collect_dbg2", 0) + 1
+            _opd_dbg(
+                "built req=%s kept_rejects=%s first=%s",
+                request_id,
+                fields.get("dflash_reject_token_count"),
+                fields.get("dflash_reject_token_indices", [])[:8],
+            )
+        return fields
 
     async def wake_up(self):
         if self.node_rank != 0:
@@ -853,10 +1020,28 @@ class vLLMHttpServer:
         return ["kv_cache", "weights"]
 
     async def _sleep_hybrid(self):
-        """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
-        # Don't use engine.sleep(level=2) here
-        # lora only update adapter weights, so set sleep level to 1
-        if self.lora_as_adapter:
+        """HYBRID sleep: pick a level that preserves weights the wake will NOT re-stream.
+
+        vLLM sleep semantics:
+          - level=1 offloads weights to host RAM and restores them on wake_up;
+          - level=2 frees the weight memory *without* a host copy, so the
+            content after wake_up is uninitialized until the caller re-syncs it.
+
+        Two cases must keep their resident weights across sleep/wake because the
+        subsequent ``update_weights`` only re-streams a subset:
+          - LoRA-as-adapter: only the adapter is synced, base weights stay.
+          - Composed DFLASH/EAGLE3 OPD student: only the trainable ``draft``
+            subtree is streamed (``dflash_draft_only``); the frozen *target*
+            weights are loaded once at engine init and never sent again.
+
+        Using level=2 for the composed student drops the frozen target after the
+        first sleep, so the target runs on uninitialized memory: its logits blow
+        up (``logits_absmax=inf``), argmax collapses to token 0, every draft
+        token is trivially "accepted" (no rejection anchors), OPD loss is
+        identically 0 and generation degenerates (responses fill to max_tokens
+        and never emit EOS). Keep such engines at level=1.
+        """
+        if self.lora_as_adapter or self.is_composed_dflash_student:
             sleep_level = 1
         else:
             sleep_level = 2
