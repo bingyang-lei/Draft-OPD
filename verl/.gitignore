@@ -22,6 +22,7 @@ tensorflow/my_graph/*
 
 # Distribution / packaging
 .Python
+replay_distribute_log/
 # env/
 build/
 develop-eggs/

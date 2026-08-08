@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.customized_info_utils import (
     append_dflash_reject_token_mask,
+    append_dflash_replay_block_metadata,
     append_dflash_rejected_draft_metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -426,12 +427,34 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
             append_dflash_reject_token_mask(
                 req,
                 appended,
                 output_ids_already_updated=True,
             )
             reached_rejection_point = appended >= acc_len + 1
+            anchor_index = len(req.output_ids) - appended - 1
+            if reached_rejection_point:
+                drafted_len = max_acc
+            elif acc_len >= max_acc and appended >= max_acc:
+                drafted_len = max_acc
+            else:
+                drafted_len = accept_length_per_req_cpu[-1]
+            custom_params = getattr(req.sampling_params, "custom_params", None)
+            use_replay_dis = (
+                isinstance(custom_params, dict)
+                and bool(custom_params.get("use_replay_dis", False))
+            )
+            if use_replay_dis:
+                append_dflash_replay_block_metadata(
+                    req,
+                    appended,
+                    anchor_index=anchor_index,
+                    accepted_length=accept_length_per_req_cpu[-1],
+                    drafted_length=drafted_len,
+                    output_ids_already_updated=True,
+                )
             if reached_rejection_point and acc_len < max_acc:
                 rejected_offsets = list(range(acc_len + 1, self.draft_token_num))
                 rejected_token_ids = [
@@ -446,7 +469,7 @@ class DFlashVerifyInput(SpecInput):
                 append_dflash_rejected_draft_metadata(
                     req,
                     appended,
-                    anchor_index=len(req.output_ids) - appended - 1,
+                    anchor_index=anchor_index,
                     offsets=rejected_offsets,
                     token_ids=rejected_token_ids,
                     teacher_logprobs=rejected_teacher_logprobs,

@@ -59,6 +59,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # 3. generate sequences
         metrics = {}
         generate_kwargs = {}
+        if kwargs.get("use_replay_dis"):
+            sampling_params = dict(sampling_params)
+            custom_params = dict(sampling_params.get("custom_params") or {})
+            custom_params["use_replay_dis"] = True
+            sampling_params["custom_params"] = custom_params
         if getattr(self.rollout_config, "name", None) == "sglang" and kwargs.get("experiment_name") is not None:
             generate_kwargs["experiment_name"] = kwargs["experiment_name"]
         if kwargs.get("preferred_server_id") is not None:

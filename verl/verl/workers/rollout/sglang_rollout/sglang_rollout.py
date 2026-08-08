@@ -109,10 +109,18 @@ async def _update_weights_with_optional_draft_flag(
             and "disable_draft_model" in getattr(UpdateWeightsFromTensorReqInput, "__dataclass_fields__", {})
         ):
             request_kwargs["disable_draft_model"] = disable_draft_model
-        if (
-            draft_model_only is not None
-            and "draft_model_only" in getattr(UpdateWeightsFromTensorReqInput, "__dataclass_fields__", {})
-        ):
+        if draft_model_only is not None:
+            if "draft_model_only" not in getattr(UpdateWeightsFromTensorReqInput, "__dataclass_fields__", {}):
+                import sglang
+
+                raise RuntimeError(
+                    "Draft-only weight sync was requested, but the installed sglang "
+                    f"({getattr(sglang, '__file__', 'unknown')}) does not support the "
+                    "'draft_model_only' field on UpdateWeightsFromTensorReqInput. Sending these "
+                    "tensors unflagged would crash the sglang scheduler (target model KeyError on "
+                    "draft weight names). Install the patched sglang (e.g. opd/sglang-dflash via "
+                    "install.sh) into the python environment that launches this run."
+                )
             request_kwargs["draft_model_only"] = draft_model_only
 
         update_weights_request = UpdateWeightsFromTensorReqInput(**request_kwargs)

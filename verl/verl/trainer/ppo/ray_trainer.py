@@ -53,6 +53,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.replay_distribution import ReplayDistributionTracker
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -1393,6 +1394,25 @@ class RayPPOTrainer:
         loss_config = self.distillation_config.distillation_loss
         return (not loss_config.use_policy_gradient) and (not loss_config.use_task_rewards)
 
+    def _is_replay_distribution_enabled(self) -> bool:
+        if not is_distillation_enabled(self.config.get("distillation")) or self.distillation_config is None:
+            return False
+        return bool(getattr(self.distillation_config.distillation_loss, "use_replay_dis", False))
+
+    def _compute_replay_distribution_mismatch(self, batch: DataProto) -> dict[str, Any]:
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=False,
+            compute_loss=False,
+            opd_use_replay_dis=True,
+            opd_rejected_draft_first_token_only=False,
+        )
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        metrics = tu.get(output, "metrics")
+        return metrics or {}
+
     def _update_actor(self, batch: DataProto, effective_mini_batch_size: Optional[int] = None) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1412,12 +1432,14 @@ class RayPPOTrainer:
         )
         rejected_draft_position_decay_enabled = False
         rejected_draft_position_decay = 1.0
+        rejected_draft_first_token_only = False
         if is_distillation_enabled(self.config.get("distillation")) and self.distillation_config is not None:
             loss_config = self.distillation_config.distillation_loss
             rejected_draft_position_decay_enabled = bool(
                 getattr(loss_config, "rejected_draft_position_decay_enabled", True)
             )
             rejected_draft_position_decay = float(getattr(loss_config, "rejected_draft_position_decay", 0.9))
+            rejected_draft_first_token_only = bool(getattr(loss_config, "rejected_draft_first_token_only", False))
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         if effective_mini_batch_size is not None:
@@ -1436,6 +1458,7 @@ class RayPPOTrainer:
             dataloader_kwargs={"shuffle": shuffle},
             opd_rejected_draft_position_decay_enabled=rejected_draft_position_decay_enabled,
             opd_rejected_draft_position_decay=rejected_draft_position_decay,
+            opd_rejected_draft_first_token_only=rejected_draft_first_token_only,
             compute_loss=True,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
@@ -1730,6 +1753,11 @@ class RayPPOTrainer:
 
         # we start from step 1
         self.global_steps += 1
+        replay_distribution_tracker = (
+            ReplayDistributionTracker(total_training_steps=self.total_training_steps)
+            if self._is_replay_distribution_enabled()
+            else None
+        )
         last_val_metrics = None
         self.max_steps_duration = 0
 
@@ -1779,6 +1807,8 @@ class RayPPOTrainer:
                 gen_batch.non_tensor_batch["experiment_name"] = np.array(
                     [self.config.trainer.experiment_name] * len(gen_batch), dtype=object
                 )
+                if replay_distribution_tracker is not None:
+                    gen_batch.non_tensor_batch["use_replay_dis"] = np.array([True] * len(gen_batch), dtype=object)
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -2008,6 +2038,12 @@ class RayPPOTrainer:
                             critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                             metrics.update(critic_output_metrics)
 
+                        if replay_distribution_tracker is not None:
+                            with marked_timer("replay_dis_mismatch", timing_raw, color="blue"):
+                                replay_distribution_tracker.update_mismatch(
+                                    self._compute_replay_distribution_mismatch(batch)
+                                )
+
                         checkpoint_saved_this_step = False
                         save_by_test_metric_enabled = self._save_by_test_metric_enabled()
 
@@ -2108,6 +2144,11 @@ class RayPPOTrainer:
 
                 if completed_batch is not None:
                     update_step += 1
+                    if replay_distribution_tracker is not None:
+                        replay_distribution_tracker.update_rollout(
+                            completed_gen_output,
+                            fallback_global_step=self.global_steps,
+                        )
                     metrics.update(compute_sglang_rollout_metrics(completed_gen_output, pending_timing_raw))
                     # training metrics
                     metrics.update(
@@ -2174,6 +2215,24 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    if replay_distribution_tracker is not None:
+                        replay_output_dir = replay_distribution_tracker.save(
+                            experiment_name=self.config.trainer.experiment_name,
+                            root="/mnt/shared-storage-user/leihaodi/opd/verl/replay_distribute_log",
+                        )
+                        print(f"Replay distribution results saved to: {replay_output_dir}")
+                        print(replay_distribution_tracker.format_composition_summary())
+                        print(replay_distribution_tracker.format_mismatch_summary())
+                        print(
+                            replay_distribution_tracker.format_anchor_summary(
+                                "first_half", "anchor_position_frequency_first_half"
+                            )
+                        )
+                        print(
+                            replay_distribution_tracker.format_anchor_summary(
+                                "second_half", "anchor_position_frequency_second_half"
+                            )
+                        )
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return

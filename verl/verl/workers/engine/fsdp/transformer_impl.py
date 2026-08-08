@@ -1009,12 +1009,26 @@ class FSDPEngineWithLMHead(FSDPEngine):
         *,
         batch_size: int,
         max_tokens_per_sample: Optional[int],
+        raw_anchor_indices=None,
+        raw_offsets=None,
+        first_token_only: bool = False,
     ) -> int:
         token_ids = cls._normalize_dflash_rejected_draft_values(raw_token_ids, batch_size=batch_size, cast_fn=int)
         if len(token_ids) != batch_size:
             raise ValueError(
                 "DFLASH rejected draft metadata batch size mismatch: "
                 f"token_ids has {len(token_ids)} entries for batch_size={batch_size}."
+            )
+        if first_token_only:
+            anchors = cls._normalize_dflash_rejected_draft_values(
+                raw_anchor_indices, batch_size=batch_size, cast_fn=int
+            )
+            offsets = cls._normalize_dflash_rejected_draft_values(raw_offsets, batch_size=batch_size, cast_fn=int)
+            token_ids, _, _, _ = cls._filter_dflash_rejected_draft_first_tokens(
+                anchors=anchors,
+                offsets=offsets,
+                token_ids=token_ids,
+                teacher_logprobs=None,
             )
         count = 0
         for sample_token_ids in token_ids:
@@ -1033,6 +1047,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
         batch_size: int,
         max_tokens_per_sample: Optional[int],
         decay: float,
+        raw_anchor_indices=None,
+        first_token_only: bool = False,
     ) -> float:
         if decay <= 0.0 or decay > 1.0:
             raise ValueError(f"rejected_draft_position_decay must be in (0, 1], got {decay}.")
@@ -1043,6 +1059,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "DFLASH rejected draft metadata batch size mismatch: "
                 f"token_ids has {len(token_ids)} entries and offsets has {len(offsets)} entries "
                 f"for batch_size={batch_size}."
+            )
+        if first_token_only:
+            anchors = cls._normalize_dflash_rejected_draft_values(
+                raw_anchor_indices, batch_size=batch_size, cast_fn=int
+            )
+            token_ids, offsets, _, _ = cls._filter_dflash_rejected_draft_first_tokens(
+                anchors=anchors,
+                offsets=offsets,
+                token_ids=token_ids,
+                teacher_logprobs=None,
             )
 
         total_weight = 0.0
@@ -1065,14 +1091,21 @@ class FSDPEngineWithLMHead(FSDPEngine):
     def _compute_extra_global_batch_info(self, data: TensorDict) -> dict[str, float]:
         if not self._is_composed_dflash_module():
             return {}
+        raw_anchors = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_anchor_indices", default=None)
         raw_token_ids = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_token_ids", default=None)
         raw_offsets = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_offsets", default=None)
         batch_size = int(data.batch_size[0])
         max_tokens_per_sample = self._get_dflash_rejected_draft_max_tokens_per_sample()
+        first_token_only = bool(
+            tu.get_non_tensor_data(data=data, key="opd_rejected_draft_first_token_only", default=False)
+        )
         local_count = self._count_dflash_rejected_draft_tokens(
             raw_token_ids,
             batch_size=batch_size,
             max_tokens_per_sample=max_tokens_per_sample,
+            raw_anchor_indices=raw_anchors,
+            raw_offsets=raw_offsets,
+            first_token_only=first_token_only,
         )
         global_count = torch.tensor(float(local_count), dtype=torch.float32, device=get_device_id())
         torch.distributed.all_reduce(
@@ -1083,7 +1116,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         position_decay_enabled = bool(
             tu.get_non_tensor_data(data=data, key="opd_rejected_draft_position_decay_enabled", default=False)
         )
-        if position_decay_enabled and raw_offsets is not None:
+        if position_decay_enabled and not first_token_only and raw_offsets is not None:
             position_decay = float(
                 tu.get_non_tensor_data(data=data, key="opd_rejected_draft_position_decay", default=0.9)
             )
@@ -1093,6 +1126,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 batch_size=batch_size,
                 max_tokens_per_sample=max_tokens_per_sample,
                 decay=position_decay,
+                raw_anchor_indices=raw_anchors,
+                first_token_only=first_token_only,
             )
             global_effective_count = torch.tensor(
                 float(local_effective_count), dtype=torch.float32, device=get_device_id()
@@ -1127,6 +1162,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     @staticmethod
     def _normalize_dflash_rejected_draft_values(raw_values, batch_size: int, cast_fn) -> list[list]:
+        def flatten_item(value) -> list:
+            value = tu.unwrap_non_tensor_data(value)
+            if value is None:
+                return []
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+            if isinstance(value, (list, tuple)):
+                flattened = []
+                for sub_value in value:
+                    flattened.extend(flatten_item(sub_value))
+                return flattened
+            return [cast_fn(value)]
+
         if raw_values is None:
             return [[] for _ in range(batch_size)]
         raw_values = tu.unwrap_non_tensor_data(raw_values)
@@ -1139,28 +1187,68 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 pass
         if isinstance(raw_values, (list, tuple)):
             raw_values = [tu.unwrap_non_tensor_data(item) for item in raw_values]
-        if batch_size == 1 and (
-            not isinstance(raw_values, (list, tuple))
-            or (raw_values and all(not isinstance(item, (list, tuple)) for item in raw_values))
-        ):
+        if batch_size == 1:
             raw_values = [raw_values]
 
         normalized: list[list] = []
         for item in raw_values:
-            item = tu.unwrap_non_tensor_data(item)
-            if item is None:
-                normalized.append([])
-            elif hasattr(item, "tolist"):
-                item = item.tolist()
-                if isinstance(item, list):
-                    normalized.append([cast_fn(x) for x in item])
-                else:
-                    normalized.append([cast_fn(item)])
-            elif isinstance(item, (list, tuple)):
-                normalized.append([cast_fn(x) for x in item])
-            else:
-                normalized.append([cast_fn(item)])
+            normalized.append(flatten_item(item))
         return normalized
+
+    @staticmethod
+    def _filter_dflash_rejected_draft_first_tokens(
+        *,
+        anchors: list[list[int]],
+        offsets: list[list[int]],
+        token_ids: list[list[int]],
+        teacher_logprobs: Optional[list[list[float]]],
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]], Optional[list[list[float]]]]:
+        filtered_anchors: list[list[int]] = []
+        filtered_offsets: list[list[int]] = []
+        filtered_token_ids: list[list[int]] = []
+        filtered_teacher_logprobs: Optional[list[list[float]]] = [] if teacher_logprobs is not None else None
+
+        for sample_idx in range(len(token_ids)):
+            sample_anchors = anchors[sample_idx] if sample_idx < len(anchors) else []
+            sample_offsets = offsets[sample_idx] if sample_idx < len(offsets) else []
+            sample_token_ids = token_ids[sample_idx]
+            sample_teacher_logprobs = (
+                teacher_logprobs[sample_idx] if teacher_logprobs is not None and sample_idx < len(teacher_logprobs) else []
+            )
+            lengths = {len(sample_anchors), len(sample_offsets), len(sample_token_ids)}
+            if teacher_logprobs is not None:
+                lengths.add(len(sample_teacher_logprobs))
+            if len(lengths) != 1:
+                raise ValueError(
+                    "DFLASH rejected draft metadata length mismatch for first-token filtering "
+                    f"sample {sample_idx}: anchors={len(sample_anchors)}, offsets={len(sample_offsets)}, "
+                    f"token_ids={len(sample_token_ids)}"
+                    + (
+                        f", teacher_logprobs={len(sample_teacher_logprobs)}."
+                        if teacher_logprobs is not None
+                        else "."
+                    )
+                )
+
+            selected_by_anchor: dict[int, tuple[int, int, int, int, Optional[float]]] = {}
+            for item_idx, (anchor, offset, token_id) in enumerate(
+                zip(sample_anchors, sample_offsets, sample_token_ids, strict=True)
+            ):
+                if token_id < 0 or offset <= 0:
+                    continue
+                teacher_value = sample_teacher_logprobs[item_idx] if teacher_logprobs is not None else None
+                current = selected_by_anchor.get(anchor)
+                if current is None or offset < current[2]:
+                    selected_by_anchor[anchor] = (item_idx, anchor, offset, token_id, teacher_value)
+
+            selected_items = sorted(selected_by_anchor.values(), key=lambda item: item[0])
+            filtered_anchors.append([anchor for _, anchor, _, _, _ in selected_items])
+            filtered_offsets.append([offset for _, _, offset, _, _ in selected_items])
+            filtered_token_ids.append([token_id for _, _, _, token_id, _ in selected_items])
+            if filtered_teacher_logprobs is not None:
+                filtered_teacher_logprobs.append([float(teacher_value) for _, _, _, _, teacher_value in selected_items])
+
+        return filtered_anchors, filtered_offsets, filtered_token_ids, filtered_teacher_logprobs
 
     @classmethod
     def _build_dflash_rejected_draft_tensors(
@@ -1198,6 +1286,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
             batch_size=batch_size,
             cast_fn=float,
         )
+        first_token_only = bool(
+            tu.get_non_tensor_data(data=micro_batch, key="opd_rejected_draft_first_token_only", default=False)
+        )
+        if first_token_only:
+            anchors, offsets, token_ids, teacher_logprobs = cls._filter_dflash_rejected_draft_first_tokens(
+                anchors=anchors,
+                offsets=offsets,
+                token_ids=token_ids,
+                teacher_logprobs=teacher_logprobs,
+            )
 
         for key, values in (
             ("anchor_indices", anchors),
@@ -1253,6 +1351,69 @@ class FSDPEngineWithLMHead(FSDPEngine):
             "dflash_rejected_draft_token_ids": token_tensor,
             "dflash_rejected_draft_teacher_logprobs": teacher_tensor,
             "dflash_rejected_draft_mask": mask_tensor,
+        }
+
+    @classmethod
+    def _build_dflash_replay_block_tensors(
+        cls,
+        *,
+        micro_batch: TensorDict,
+        batch_size: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        anchors = cls._normalize_dflash_rejected_draft_values(
+            tu.get_non_tensor_data(data=micro_batch, key="dflash_replay_block_anchor_indices", default=None),
+            batch_size=batch_size,
+            cast_fn=int,
+        )
+        accepted_lengths = cls._normalize_dflash_rejected_draft_values(
+            tu.get_non_tensor_data(data=micro_batch, key="dflash_replay_block_accepted_lengths", default=None),
+            batch_size=batch_size,
+            cast_fn=int,
+        )
+        drafted_lengths = cls._normalize_dflash_rejected_draft_values(
+            tu.get_non_tensor_data(data=micro_batch, key="dflash_replay_block_drafted_lengths", default=None),
+            batch_size=batch_size,
+            cast_fn=int,
+        )
+        for sample_idx in range(batch_size):
+            lengths = {
+                len(anchors[sample_idx]),
+                len(accepted_lengths[sample_idx]),
+                len(drafted_lengths[sample_idx]),
+            }
+            if len(lengths) != 1:
+                raise ValueError(
+                    "DFLASH replay block metadata length mismatch for sample "
+                    f"{sample_idx}: anchors={len(anchors[sample_idx])}, "
+                    f"accepted={len(accepted_lengths[sample_idx])}, drafted={len(drafted_lengths[sample_idx])}."
+                )
+
+        max_items = max((len(item) for item in anchors), default=0)
+        width = max(max_items, 1)
+        anchor_tensor = torch.full((batch_size, width), -2, dtype=torch.long, device=device)
+        accepted_tensor = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+        drafted_tensor = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+        mask_tensor = torch.zeros((batch_size, width), dtype=torch.bool, device=device)
+
+        for sample_idx in range(batch_size):
+            count = len(anchors[sample_idx])
+            if count == 0:
+                continue
+            anchor_tensor[sample_idx, :count] = torch.tensor(anchors[sample_idx], dtype=torch.long, device=device)
+            accepted_tensor[sample_idx, :count] = torch.tensor(
+                accepted_lengths[sample_idx], dtype=torch.long, device=device
+            )
+            drafted_tensor[sample_idx, :count] = torch.tensor(
+                drafted_lengths[sample_idx], dtype=torch.long, device=device
+            )
+            mask_tensor[sample_idx, :count] = True
+
+        return {
+            "dflash_replay_block_anchor_indices": anchor_tensor,
+            "dflash_replay_block_accepted_lengths": accepted_tensor,
+            "dflash_replay_block_drafted_lengths": drafted_tensor,
+            "dflash_replay_block_mask": mask_tensor,
         }
 
     @staticmethod
@@ -1406,6 +1567,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sample_indices, dtype=torch.long, device=input_ids.device
                 )
 
+        use_replay_dis = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_replay_dis", default=False))
         model_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -1421,7 +1583,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
             "dflash_calculate_entropy": tu.get_non_tensor_data(
                 data=micro_batch, key="calculate_entropy", default=False
             ),
+            "dflash_use_replay_dis": use_replay_dis,
         }
+        if use_replay_dis:
+            model_inputs.update(
+                self._build_dflash_replay_block_tensors(
+                    micro_batch=micro_batch,
+                    batch_size=batch_size,
+                    device=input_ids.device,
+                )
+            )
         return model_inputs, {"dflash_opd": True}
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -1573,6 +1744,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = output.get("dflash_log_probs")
                 dflash_entropy = output.get("dflash_entropy")
                 dflash_loss_mask = output.get("dflash_loss_mask")
+                dflash_response_offsets = output.get("dflash_response_offsets")
                 dflash_rejected_draft_student_log_probs = output.get("dflash_rejected_draft_student_log_probs")
                 dflash_rejected_draft_teacher_log_probs = output.get("dflash_rejected_draft_teacher_log_probs")
                 dflash_rejected_draft_loss_mask = output.get("dflash_rejected_draft_loss_mask")
@@ -1583,6 +1755,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = getattr(output, "dflash_log_probs", None)
                 dflash_entropy = getattr(output, "dflash_entropy", None)
                 dflash_loss_mask = getattr(output, "dflash_loss_mask", None)
+                dflash_response_offsets = getattr(output, "dflash_response_offsets", None)
                 dflash_rejected_draft_student_log_probs = getattr(
                     output, "dflash_rejected_draft_student_log_probs", None
                 )
@@ -1618,6 +1791,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "log_probs": format_dflash_sequence_output(dflash_log_probs),
                 "opd_loss_mask": format_dflash_sequence_output(dflash_loss_mask),
             }
+            if dflash_response_offsets is not None:
+                model_output["opd_response_offsets"] = format_dflash_sequence_output(dflash_response_offsets)
             if eagle3_native_ce_losses is not None:
                 model_output["eagle3_native_ce_losses"] = format_dflash_sequence_output(eagle3_native_ce_losses)
             if eagle3_selected_scalar_loss_mask is not None:
@@ -1653,6 +1828,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 value = output.get(source_key) if isinstance(output, dict) else getattr(output, source_key, None)
                 if value is not None:
                     model_output[output_key] = value
+            for state_group in (
+                "matched_target_trajectory",
+                "accepted_replay",
+                "first_rejected_replay",
+                "post_rejection_suffix_replay",
+            ):
+                for source_suffix, output_suffix in (("sum_kl", "sum_KL"), ("num_states", "num_states")):
+                    source_key = f"dflash_replay_dis_{state_group}_{source_suffix}"
+                    value = output.get(source_key) if isinstance(output, dict) else getattr(output, source_key, None)
+                    if value is not None:
+                        model_output[f"replay_dis/mismatch/{state_group}/{output_suffix}"] = value
             calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
             if calculate_entropy:
                 if dflash_entropy is None:
@@ -1806,6 +1992,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            for key, value in model_output.items():
+                if key.startswith("replay_dis/") and isinstance(value, torch.Tensor) and value.dim() == 0:
+                    metrics[key] = value.detach().float().item()
 
             def keep_postprocess_model_output(value: object) -> bool:
                 if not isinstance(value, torch.Tensor):

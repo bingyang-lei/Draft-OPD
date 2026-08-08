@@ -235,6 +235,8 @@ def copy_local_path_from_hdfs(
     """Deprecated. Please use copy_to_local instead."""
     from filelock import FileLock
 
+    if not src:
+        raise ValueError("copy_to_local source path is empty.")
     assert src[-1] != "/", f"Make sure the last char in src is not / because it will cause error. Got {src}"
 
     if is_non_local(src):

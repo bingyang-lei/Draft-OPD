@@ -928,6 +928,90 @@ def test_rejected_draft_position_decay_weights_loss_by_draft_offset():
     assert torch.allclose(loss, (rejected_losses * weights).sum() / weights.sum())
 
 
+def test_accept_draft_position_decay_weights_response_by_draft_offset():
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]], dtype=torch.long),
+            "responses": torch.tensor([[2, 3]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, 0.0]),
+        },
+        batch_size=[1],
+    )
+    response_student = torch.tensor([-0.4, -0.9], dtype=torch.float32)
+    response_teacher = torch.tensor([-0.5, -0.7], dtype=torch.float32)
+    model_output = {
+        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
+        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
+        "opd_response_offsets": torch.tensor([1, 2, 0], dtype=torch.long),
+    }
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+    loss_config = SimpleNamespace(
+        loss_mode="k3",
+        loss_max_clamp=None,
+        use_policy_gradient=False,
+        accept_draft_position_decay_enabled=True,
+        rejected_draft_position_decay=0.5,
+    )
+    distillation_config = SimpleNamespace(distillation_loss=loss_config)
+
+    loss, _ = distillation_loss(config, distillation_config, model_output, data)
+
+    response_losses = kl_penalty(response_student, response_teacher, "k3")
+    weights = torch.tensor([1.0, 0.5], dtype=torch.float32)
+    assert torch.allclose(loss, (response_losses * weights).sum() / weights.sum())
+
+
+def test_accept_and_rejected_draft_position_decay_share_decay_value():
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]], dtype=torch.long),
+            "responses": torch.tensor([[2, 3]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "teacher_logprobs": _single_sequence_logprobs([-0.5, -0.7, 0.0]),
+        },
+        batch_size=[1],
+    )
+    response_student = torch.tensor([-0.4, -0.9], dtype=torch.float32)
+    response_teacher = torch.tensor([-0.5, -0.7], dtype=torch.float32)
+    rejected_student = torch.tensor([-1.1, -0.8], dtype=torch.float32)
+    rejected_teacher = torch.tensor([-0.6, -1.2], dtype=torch.float32)
+    model_output = {
+        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
+        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
+        "opd_response_offsets": torch.tensor([1, 2, 0], dtype=torch.long),
+        "opd_rejected_draft_student_log_probs": rejected_student.unsqueeze(0),
+        "opd_rejected_draft_teacher_log_probs": rejected_teacher.unsqueeze(0),
+        "opd_rejected_draft_loss_mask": torch.tensor([[True, True]]),
+        "opd_rejected_draft_offsets": torch.tensor([[1, 3]]),
+    }
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+    loss_config = SimpleNamespace(
+        loss_mode="k3",
+        loss_max_clamp=None,
+        use_policy_gradient=False,
+        response_stream_weight=1.0,
+        rejected_draft_stream_weight=2.0,
+        accept_draft_position_decay_enabled=True,
+        rejected_draft_position_decay_enabled=True,
+        rejected_draft_position_decay=0.5,
+    )
+    distillation_config = SimpleNamespace(distillation_loss=loss_config)
+
+    loss, _ = distillation_loss(config, distillation_config, model_output, data)
+
+    response_losses = kl_penalty(response_student, response_teacher, "k3")
+    rejected_losses = kl_penalty(rejected_student, rejected_teacher, "k3")
+    response_weights = torch.tensor([1.0, 0.5], dtype=torch.float32)
+    rejected_weights = torch.tensor([1.0, 0.25], dtype=torch.float32)
+    expected = (
+        (response_losses * response_weights).sum() + 2.0 * (rejected_losses * rejected_weights).sum()
+    ) / (response_weights.sum() + 2.0 * rejected_weights.sum())
+    assert torch.allclose(loss, expected)
+
+
 def _single_sample_position_decay_combined_loss(
     response_student,
     response_teacher,
@@ -1101,3 +1185,55 @@ def test_count_dflash_rejected_draft_tokens_respects_empty_values_and_limit():
         )
         == 0
     )
+
+
+def test_count_dflash_rejected_draft_tokens_can_keep_first_reject_per_anchor():
+    assert (
+        FSDPEngineWithLMHead._count_dflash_rejected_draft_tokens(
+            [[10, 11, 12, 13]],
+            batch_size=1,
+            max_tokens_per_sample=None,
+            raw_anchor_indices=[[0, 0, 1, 1]],
+            raw_offsets=[[4, 3, 2, 5]],
+            first_token_only=True,
+        )
+        == 2
+    )
+    assert (
+        FSDPEngineWithLMHead._count_dflash_rejected_draft_tokens(
+            [[10, 11, 12, 13]],
+            batch_size=1,
+            max_tokens_per_sample=1,
+            raw_anchor_indices=[[0, 0, 1, 1]],
+            raw_offsets=[[4, 3, 2, 5]],
+            first_token_only=True,
+        )
+        == 1
+    )
+
+
+def test_build_dflash_rejected_draft_tensors_filters_first_reject_per_anchor():
+    batch = TensorDict({}, batch_size=[1])
+    tu.assign_non_tensor(
+        batch,
+        dflash_rejected_draft_anchor_indices=[[0, 0, 1, 1]],
+        dflash_rejected_draft_offsets=[[4, 3, 2, 5]],
+        dflash_rejected_draft_token_ids=[[10, 11, 12, 13]],
+        dflash_rejected_draft_teacher_logprobs=[[-0.4, -0.3, -0.2, -0.5]],
+        opd_rejected_draft_first_token_only=True,
+    )
+
+    tensors = FSDPEngineWithLMHead._build_dflash_rejected_draft_tensors(
+        micro_batch=batch,
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+
+    assert tensors["dflash_rejected_draft_anchor_indices"].tolist() == [[0, 1]]
+    assert tensors["dflash_rejected_draft_offsets"].tolist() == [[3, 2]]
+    assert tensors["dflash_rejected_draft_token_ids"].tolist() == [[11, 12]]
+    assert torch.allclose(
+        tensors["dflash_rejected_draft_teacher_logprobs"],
+        torch.tensor([[-0.3, -0.2]], dtype=torch.float32),
+    )
+    assert tensors["dflash_rejected_draft_mask"].tolist() == [[True, True]]

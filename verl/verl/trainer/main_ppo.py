@@ -258,9 +258,13 @@ class TaskRunner:
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
+        model_path = config.actor_rollout_ref.model.path
+        if not model_path:
+            raise ValueError(
+                "actor_rollout_ref.model.path is empty. Set MAIN_MODEL_PATH or pass "
+                "actor_rollout_ref.model.path=/path/to/model."
+            )
+        local_path = copy_to_local(model_path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer

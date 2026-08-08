@@ -55,6 +55,12 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_position_decay (float):
         Per-draft-offset decay for rejected draft token loss weights. The first drafted token uses weight 1.0,
         the second uses this value, the third uses this value squared, and so on.
+    accept_draft_position_decay_enabled (bool):
+        Whether to decay accepted/response token loss weights by draft offset using rejected_draft_position_decay.
+    rejected_draft_first_token_only (bool):
+        Whether to train only on the first rejected draft token per speculative step/anchor.
+    use_replay_dis (bool):
+        Whether to collect Draft-OPD replay distribution diagnostics. This is default-off and never changes loss.
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -88,6 +94,9 @@ class DistillationLossConfig(BaseConfig):
     rejected_draft_use_reverse_kl: bool = False
     rejected_draft_position_decay_enabled: bool = True
     rejected_draft_position_decay: float = 0.9
+    accept_draft_position_decay_enabled: bool = False
+    rejected_draft_first_token_only: bool = False
+    use_replay_dis: bool = False
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
