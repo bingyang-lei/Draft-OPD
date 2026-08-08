@@ -622,6 +622,9 @@ class SGLangHttpServer:
             "dflash_rejected_draft_offsets",
             "dflash_rejected_draft_token_ids",
             "dflash_rejected_draft_teacher_logprobs",
+            "dflash_replay_block_anchor_indices",
+            "dflash_replay_block_accepted_lengths",
+            "dflash_replay_block_drafted_lengths",
         ):
             if dflash_meta_key in meta_info:
                 extra_fields[dflash_meta_key] = meta_info[dflash_meta_key]

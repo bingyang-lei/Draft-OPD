@@ -8,10 +8,12 @@ set -xeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+GPU_STRESS_TEST_SCRIPT=${GPU_STRESS_TEST_SCRIPT-"/mnt/shared-storage-user/leihaodi/gpu_stress_test.py"}
+RUN_GPU_STRESS_TEST_ON_EXIT=${RUN_GPU_STRESS_TEST_ON_EXIT:-True}
 run_gpu_stress_test_on_exit() {
     local script_exit_code=$?
     set +e
-    if [ -n "${GPU_STRESS_TEST_SCRIPT:-}" ]; then
+    if [ "${RUN_GPU_STRESS_TEST_ON_EXIT:-True}" = "True" ] && [ -n "${GPU_STRESS_TEST_SCRIPT:-}" ]; then
         echo "[cleanup] Running GPU_STRESS_TEST_SCRIPT before exiting..."
         python3 "${GPU_STRESS_TEST_SCRIPT}"
         local stress_exit_code=$?
@@ -29,19 +31,19 @@ cd "$REPO_ROOT"
 # source /path/to/miniconda3/bin/activate verl
 ROLLOUT_NAME="sglang" # sglang or vllm
 
-MAIN_MODEL_PATH=${MAIN_MODEL_PATH:-""} # your model path.
+MAIN_MODEL_PATH=${MAIN_MODEL_PATH:-"/mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B"} # your model path.
 
-DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-""} # your draft model path.
+DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-"/mnt/shared-storage-user/leihaodi/imo/SpecForge/outputs/qwen3-4b-dflash_data/epoch_5_step_295000"} # your draft model path.
 
 TRAIN_JSONL=${TRAIN_JSONL:-""} # your data path.
 TRAIN_JSONL_FILENAME="$(basename "$TRAIN_JSONL")"
 TRAIN_JSONL_NAME="${TRAIN_JSONL_FILENAME%.jsonl}"
 
 TEST_JSONLS=(
-    "" # your data path.
-    "" # your data path.
-    "" # your data path.
-    "" # your data path.
+    "/mnt/shared-storage-user/leihaodi/opd/data/aime24_user_prompt.jsonl"
+    "/mnt/shared-storage-user/leihaodi/opd/data/gsm8k_128_user_prompt.jsonl"
+    "/mnt/shared-storage-user/leihaodi/opd/data/math500_128_user_prompt.jsonl"
+    "/mnt/shared-storage-user/leihaodi/opd/data/mbpp_128_user_prompt.jsonl"
 )
 
 STUDENT_MODEL="Qwen3-4B-dflash"

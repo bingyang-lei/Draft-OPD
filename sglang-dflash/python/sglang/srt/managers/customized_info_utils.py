@@ -10,6 +10,9 @@ DFLASH_REJECTED_DRAFT_META_KEYS = frozenset(
         "dflash_rejected_draft_offsets",
         "dflash_rejected_draft_token_ids",
         "dflash_rejected_draft_teacher_logprobs",
+        "dflash_replay_block_anchor_indices",
+        "dflash_replay_block_accepted_lengths",
+        "dflash_replay_block_drafted_lengths",
     }
 )
 
@@ -163,6 +166,48 @@ def append_dflash_rejected_draft_metadata(
         "dflash_rejected_draft_offsets": offsets_list,
         "dflash_rejected_draft_token_ids": token_ids_list,
         "dflash_rejected_draft_teacher_logprobs": teacher_logprobs_list,
+    }
+    for key, chunk in chunks_by_key.items():
+        values = req.customized_info.setdefault(key, [])
+        _pad_token_aligned_metadata(values, prefix_len)
+        values.extend([[] for _ in range(committed_token_count)])
+        values[-1] = chunk
+
+
+def append_dflash_replay_block_metadata(
+    req: Any,
+    committed_token_count: int,
+    *,
+    anchor_index: int,
+    accepted_length: int,
+    drafted_length: int,
+    output_ids_already_updated: bool,
+) -> None:
+    """Append one DFLASH replay block record in response-token coordinates."""
+
+    committed_token_count = int(committed_token_count)
+    accepted_length = int(accepted_length)
+    drafted_length = int(drafted_length)
+    if committed_token_count <= 0 or drafted_length <= 0:
+        return
+    if accepted_length < 0 or accepted_length > drafted_length:
+        raise ValueError(
+            "DFLASH replay block metadata length mismatch: "
+            f"accepted_length={accepted_length}, drafted_length={drafted_length}."
+        )
+
+    if req.customized_info is None:
+        req.customized_info = {}
+
+    prefix_len = len(req.output_ids)
+    if output_ids_already_updated:
+        prefix_len -= committed_token_count
+    prefix_len = max(0, prefix_len)
+
+    chunks_by_key = {
+        "dflash_replay_block_anchor_indices": [int(anchor_index)],
+        "dflash_replay_block_accepted_lengths": [accepted_length],
+        "dflash_replay_block_drafted_lengths": [drafted_length],
     }
     for key, chunk in chunks_by_key.items():
         values = req.customized_info.setdefault(key, [])

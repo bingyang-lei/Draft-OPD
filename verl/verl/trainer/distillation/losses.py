@@ -524,6 +524,9 @@ def _build_rejected_draft_position_weights(
     rejected_draft_mask: torch.Tensor,
     loss_config: DistillationLossConfig,
 ) -> tuple[torch.Tensor, bool]:
+    if bool(getattr(loss_config, "rejected_draft_first_token_only", False)):
+        return rejected_draft_mask.to(dtype=torch.float32), False
+
     enabled = bool(getattr(loss_config, "rejected_draft_position_decay_enabled", True))
     if not enabled:
         return rejected_draft_mask.to(dtype=torch.float32), False
@@ -545,6 +548,37 @@ def _build_rejected_draft_position_weights(
     exponents = (offsets.to(dtype=torch.float32) - 1.0).clamp_min(0.0)
     weights = torch.pow(offsets.new_tensor(decay, dtype=torch.float32), exponents)
     return weights * rejected_draft_mask.to(dtype=torch.float32), True
+
+
+def _build_response_position_weights(
+    *,
+    data: TensorDict,
+    model_output: dict,
+    effective_response_mask: torch.Tensor,
+    loss_config: DistillationLossConfig,
+) -> tuple[torch.Tensor, bool]:
+    enabled = bool(getattr(loss_config, "accept_draft_position_decay_enabled", False))
+    if not enabled:
+        return effective_response_mask.to(dtype=torch.float32), False
+
+    offsets = model_output.get("opd_response_offsets")
+    if offsets is None:
+        return effective_response_mask.to(dtype=torch.float32), False
+
+    offsets = no_padding_2_padding(offsets, data).to(device=effective_response_mask.device)
+    if offsets.shape != effective_response_mask.shape:
+        raise RuntimeError(
+            "Accepted DFLASH draft offsets must match the response mask shape, got "
+            f"offsets={tuple(offsets.shape)}, mask={tuple(effective_response_mask.shape)}."
+        )
+
+    decay = float(getattr(loss_config, "rejected_draft_position_decay", 0.9))
+    if decay <= 0.0 or decay > 1.0:
+        raise ValueError(f"rejected_draft_position_decay must be in (0, 1], got {decay}.")
+
+    exponents = (offsets.to(dtype=torch.float32) - 1.0).clamp_min(0.0)
+    weights = torch.pow(offsets.new_tensor(decay, dtype=torch.float32), exponents)
+    return weights * effective_response_mask.to(dtype=torch.float32), True
 
 
 def _agg_loss_global_batch_info(config: ActorConfig) -> dict[str, Any]:
@@ -611,6 +645,13 @@ def distillation_loss(
             )
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+
+    response_loss_weights, response_position_decay_applied = _build_response_position_weights(
+        data=data,
+        model_output=model_output,
+        effective_response_mask=effective_response_mask,
+        loss_config=loss_config,
+    )
 
     if rejected_draft_stream is not None:
         response_valid_losses = distillation_losses[effective_response_mask.bool()]
@@ -692,24 +733,40 @@ def distillation_loss(
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if rejected_draft_losses is None:
-            distillation_loss = agg_loss(
-                loss_mat=distillation_losses,
-                loss_mask=effective_response_mask,
-                loss_agg_mode=loss_agg_mode,
-                **_agg_loss_global_batch_info(config),
-            )
+            if response_position_decay_applied:
+                response_sum = (distillation_losses * response_loss_weights.to(dtype=distillation_losses.dtype)).sum()
+                response_effective_count = response_loss_weights.sum().to(dtype=distillation_losses.dtype)
+                global_response_effective_count = _global_sum(response_effective_count, dp_group)
+                denom = _scalar_like(global_response_effective_count, response_effective_count)
+                if denom.item() <= 0:
+                    distillation_loss = response_sum * 0.0
+                else:
+                    distillation_loss = response_sum / denom
+                    distillation_loss = distillation_loss * _scalar_like(
+                        getattr(config, "global_batch_info", {}).get("dp_size", 1), distillation_loss
+                    )
+            else:
+                distillation_loss = agg_loss(
+                    loss_mat=distillation_losses,
+                    loss_mask=effective_response_mask,
+                    loss_agg_mode=loss_agg_mode,
+                    **_agg_loss_global_batch_info(config),
+                )
         else:
             response_weight = float(getattr(loss_config, "response_stream_weight", 1.0))
             rejected_weight = float(getattr(loss_config, "rejected_draft_stream_weight", 1.0))
             global_batch_info = getattr(config, "global_batch_info", {}) or {}
             response_count = effective_response_mask.sum().to(dtype=distillation_losses.dtype)
+            response_effective_count = response_loss_weights.sum().to(dtype=distillation_losses.dtype)
             rejected_count = rejected_draft_mask.sum().to(dtype=distillation_losses.dtype)
             rejected_effective_count = rejected_loss_weights.sum().to(dtype=distillation_losses.dtype)
-            response_sum = (distillation_losses * effective_response_mask).sum()
+            response_sum = (distillation_losses * response_loss_weights.to(dtype=distillation_losses.dtype)).sum()
             rejected_sum = (rejected_draft_losses * rejected_loss_weights.to(dtype=rejected_draft_losses.dtype)).sum()
             global_response_count = global_batch_info.get("batch_num_tokens")
             if global_response_count is None:
                 global_response_count = response_count
+            if response_position_decay_applied:
+                global_response_count = _global_sum(response_effective_count, dp_group)
             global_rejected_count = global_batch_info.get("opd_rejected_draft_batch_num_tokens")
             if global_rejected_count is None:
                 global_rejected_count = rejected_count
@@ -723,7 +780,7 @@ def distillation_loss(
                     else _scalar_like(global_rejected_count, rejected_effective_count)
                 )
             denom = (
-                response_weight * _scalar_like(global_response_count, response_count)
+                response_weight * _scalar_like(global_response_count, response_effective_count)
                 + rejected_weight * _scalar_like(global_rejected_effective_count, rejected_effective_count)
             )
             if denom.item() <= 0:

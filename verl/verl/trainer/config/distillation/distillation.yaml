@@ -54,6 +54,15 @@ distillation_loss:
   # Per-position decay for rejected draft tokens: offset 1 -> 1.0, offset 2 -> decay, offset 3 -> decay^2.
   rejected_draft_position_decay: 0.9
 
+  # Whether accepted/response tokens also use position decay with rejected_draft_position_decay.
+  accept_draft_position_decay_enabled: false
+
+  # Whether to train only the first rejected draft token for each speculative step/anchor.
+  rejected_draft_first_token_only: false
+
+  # Whether to collect Draft-OPD replay distribution diagnostics. This is default-off and does not change training.
+  use_replay_dis: false
+
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 

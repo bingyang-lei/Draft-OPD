@@ -439,6 +439,201 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         selected_entropy = torch.cat(entropy_chunks, dim=0) if calculate_entropy else None
         return selected_log_probs, selected_entropy
 
+    def _compute_reverse_kl_sums(
+        self,
+        *,
+        q_hidden: torch.Tensor,
+        p_hidden: torch.Tensor,
+        output_embeddings: torch.nn.Module,
+        chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if q_hidden.numel() == 0:
+            zero = p_hidden.new_tensor(0.0, dtype=torch.float32)
+            return zero, zero
+
+        sum_kl = p_hidden.new_tensor(0.0, dtype=torch.float32)
+        num_states = p_hidden.new_tensor(0.0, dtype=torch.float32)
+        for start in range(0, q_hidden.shape[0], chunk_size):
+            end = min(start + chunk_size, q_hidden.shape[0])
+            q_logits = output_embeddings(q_hidden[start:end])
+            p_logits = output_embeddings(p_hidden[start:end])
+            q_log_probs = F.log_softmax(q_logits.float(), dim=-1)
+            p_log_probs = F.log_softmax(p_logits.float(), dim=-1)
+            kl = (q_log_probs.exp() * (q_log_probs - p_log_probs)).sum(dim=-1)
+            sum_kl = sum_kl + kl.sum()
+            num_states = num_states + p_hidden.new_tensor(float(kl.numel()), dtype=torch.float32)
+        return sum_kl, num_states
+
+    def _build_replay_dis_anchor_plan(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        prompt_lengths: torch.LongTensor,
+        response_lengths: torch.LongTensor,
+        replay_block_anchor_indices: torch.LongTensor,
+        replay_block_accepted_lengths: torch.LongTensor,
+        replay_block_drafted_lengths: torch.LongTensor,
+        replay_block_mask: torch.Tensor,
+        draft_block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        width = int(replay_block_anchor_indices.shape[1])
+        anchor_positions = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+        accepted_lengths = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+        drafted_lengths = torch.zeros((batch_size, width), dtype=torch.long, device=device)
+        block_keep_mask = torch.zeros((batch_size, width), dtype=torch.bool, device=device)
+        if attention_mask is not None:
+            valid_seq_lens = attention_mask.long().sum(dim=1)
+        else:
+            valid_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.long, device=device)
+
+        for batch_idx in range(batch_size):
+            prompt_len = int(prompt_lengths[batch_idx].item())
+            response_len = int(response_lengths[batch_idx].item())
+            valid_len = min(prompt_len + response_len, seq_len)
+            for item_idx in range(width):
+                if not bool(replay_block_mask[batch_idx, item_idx].item()):
+                    continue
+                accepted_len = int(replay_block_accepted_lengths[batch_idx, item_idx].item())
+                drafted_len = int(replay_block_drafted_lengths[batch_idx, item_idx].item())
+                if drafted_len <= 0:
+                    continue
+                drafted_len = min(drafted_len, draft_block_size - 1)
+                accepted_len = max(0, min(accepted_len, drafted_len))
+                anchor_resp = int(replay_block_anchor_indices[batch_idx, item_idx].item())
+                full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
+                if full_anchor < 0 or full_anchor >= valid_len:
+                    continue
+                anchor_positions[batch_idx, item_idx] = full_anchor
+                accepted_lengths[batch_idx, item_idx] = accepted_len
+                drafted_lengths[batch_idx, item_idx] = drafted_len
+                block_keep_mask[batch_idx, item_idx] = True
+
+        return anchor_positions, accepted_lengths, drafted_lengths, block_keep_mask, valid_seq_lens, replay_block_mask
+
+    def _compute_replay_dis_mismatch(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        target_hidden: torch.Tensor,
+        target_lm_hidden: torch.Tensor,
+        output_embeddings: torch.nn.Module,
+        prompt_lengths: torch.LongTensor,
+        response_lengths: torch.LongTensor,
+        replay_block_anchor_indices: Optional[torch.LongTensor],
+        replay_block_accepted_lengths: Optional[torch.LongTensor],
+        replay_block_drafted_lengths: Optional[torch.LongTensor],
+        replay_block_mask: Optional[torch.Tensor],
+        draft_block_size: int,
+        lm_head_chunk_size: int,
+        profile_enabled: bool,
+    ) -> dict[str, torch.Tensor]:
+        groups = (
+            "matched_target_trajectory",
+            "accepted_replay",
+            "first_rejected_replay",
+            "post_rejection_suffix_replay",
+        )
+        zero = target_hidden.new_tensor(0.0, dtype=torch.float32)
+        empty_metrics = {
+            f"dflash_replay_dis_{group}_{suffix}": zero.clone()
+            for group in groups
+            for suffix in ("sum_kl", "num_states")
+        }
+        if (
+            replay_block_anchor_indices is None
+            or replay_block_accepted_lengths is None
+            or replay_block_drafted_lengths is None
+            or replay_block_mask is None
+            or not bool(replay_block_mask.any())
+        ):
+            return empty_metrics
+
+        (
+            replay_anchor_positions,
+            replay_accepted_lengths,
+            replay_drafted_lengths,
+            replay_keep_mask,
+            valid_seq_lens,
+            _,
+        ) = self._build_replay_dis_anchor_plan(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+            replay_block_anchor_indices=replay_block_anchor_indices,
+            replay_block_accepted_lengths=replay_block_accepted_lengths,
+            replay_block_drafted_lengths=replay_block_drafted_lengths,
+            replay_block_mask=replay_block_mask,
+            draft_block_size=draft_block_size,
+        )
+        if not bool(replay_keep_mask.any()):
+            return empty_metrics
+
+        with torch.no_grad():
+            replay_draft_hidden, _, _ = self._run_dflash_draft_forward(
+                input_ids=input_ids,
+                target_hidden=target_hidden,
+                anchor_positions=replay_anchor_positions,
+                block_keep_mask=replay_keep_mask,
+                draft_block_size=draft_block_size,
+                profile_enabled=profile_enabled,
+                checkpoint_forward=False,
+            )
+
+            selected: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {group: [] for group in groups}
+            for block_offset in range(1, draft_block_size):
+                active_blocks = replay_keep_mask & (replay_drafted_lengths >= block_offset)
+                if not bool(active_blocks.any()):
+                    continue
+                block_indices = torch.nonzero(active_blocks, as_tuple=False)
+                batch_indices = block_indices[:, 0]
+                block_ids = block_indices[:, 1]
+                row_indices = replay_anchor_positions[batch_indices, block_ids] + (block_offset - 1)
+                label_indices = row_indices + 1
+                in_bounds = label_indices < valid_seq_lens[batch_indices]
+                if not bool(in_bounds.any()):
+                    continue
+
+                batch_indices = batch_indices[in_bounds]
+                block_ids = block_ids[in_bounds]
+                row_indices = row_indices[in_bounds]
+                flat_draft_indices = block_ids * draft_block_size + block_offset
+                q_hidden = replay_draft_hidden[batch_indices, flat_draft_indices, :]
+                p_hidden = target_lm_hidden[batch_indices, row_indices, :]
+                selected["matched_target_trajectory"].append((q_hidden, p_hidden))
+
+                accepted_lens = replay_accepted_lengths[batch_indices, block_ids]
+                accepted_mask = block_offset <= accepted_lens
+                first_rejected_mask = block_offset == (accepted_lens + 1)
+                suffix_mask = block_offset > (accepted_lens + 1)
+                for group, mask in (
+                    ("accepted_replay", accepted_mask),
+                    ("first_rejected_replay", first_rejected_mask),
+                    ("post_rejection_suffix_replay", suffix_mask),
+                ):
+                    if bool(mask.any()):
+                        selected[group].append((q_hidden[mask], p_hidden[mask]))
+
+            metrics = dict(empty_metrics)
+            for group, hidden_pairs in selected.items():
+                if not hidden_pairs:
+                    continue
+                q_group_hidden = torch.cat([pair[0] for pair in hidden_pairs], dim=0)
+                p_group_hidden = torch.cat([pair[1] for pair in hidden_pairs], dim=0)
+                sum_kl, num_states = self._compute_reverse_kl_sums(
+                    q_hidden=q_group_hidden,
+                    p_hidden=p_group_hidden,
+                    output_embeddings=output_embeddings,
+                    chunk_size=lm_head_chunk_size,
+                )
+                metrics[f"dflash_replay_dis_{group}_sum_kl"] = sum_kl.detach()
+                metrics[f"dflash_replay_dis_{group}_num_states"] = num_states.detach()
+            return metrics
+
     def _build_random_response_anchor_plan(
         self,
         *,
@@ -931,6 +1126,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         rejected_draft_mask: Optional[torch.Tensor] = None,
         calculate_entropy: bool = False,
+        use_replay_dis: bool = False,
+        replay_block_anchor_indices: Optional[torch.LongTensor] = None,
+        replay_block_accepted_lengths: Optional[torch.LongTensor] = None,
+        replay_block_drafted_lengths: Optional[torch.LongTensor] = None,
+        replay_block_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         if input_ids.dim() != 2:
@@ -953,6 +1153,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         target_kwargs.pop("dflash_rejected_draft_teacher_logprobs", None)
         target_kwargs.pop("dflash_rejected_draft_mask", None)
         target_kwargs.pop("dflash_calculate_entropy", None)
+        target_kwargs.pop("dflash_use_replay_dis", None)
+        target_kwargs.pop("dflash_replay_block_anchor_indices", None)
+        target_kwargs.pop("dflash_replay_block_accepted_lengths", None)
+        target_kwargs.pop("dflash_replay_block_drafted_lengths", None)
+        target_kwargs.pop("dflash_replay_block_mask", None)
 
         teacher_start_time = time.perf_counter()
         with torch.no_grad():
@@ -967,6 +1172,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
             if teacher_outputs.hidden_states is None:
                 raise RuntimeError("Teacher model did not return hidden states required by DFLASH draft.")
+            target_lm_hidden = teacher_outputs.hidden_states[-1]
             target_hidden = self._extract_target_hidden(teacher_outputs.hidden_states)
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
         teacher_forward_ms = (time.perf_counter() - teacher_start_time) * 1000.0
@@ -1050,6 +1256,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         lm_head_start_time = time.perf_counter()
         log_probs_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
         loss_mask_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+        response_offsets_by_seq = torch.zeros((batch_size, seq_len), dtype=torch.long, device=input_ids.device)
         entropy_by_seq = (
             target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32) if calculate_entropy else None
         )
@@ -1081,6 +1288,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             response_draft_indices: list[torch.Tensor] = []
             response_row_indices: list[torch.Tensor] = []
             response_labels: list[torch.Tensor] = []
+            response_offsets: list[torch.Tensor] = []
             for block_offset in range(1, draft_block_size):
                 active_blocks = block_keep_mask & (segment_lens >= block_offset)
                 if not bool(active_blocks.any()):
@@ -1102,12 +1310,14 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 response_draft_indices.append(flat_draft_indices)
                 response_row_indices.append(row_indices)
                 response_labels.append(input_ids[batch_indices, label_indices])
+                response_offsets.append(torch.full_like(row_indices, block_offset))
 
             if response_batch_indices:
                 response_batch_tensor = torch.cat(response_batch_indices, dim=0)
                 response_draft_tensor = torch.cat(response_draft_indices, dim=0)
                 response_row_tensor = torch.cat(response_row_indices, dim=0)
                 response_label_tensor = torch.cat(response_labels, dim=0)
+                response_offset_tensor = torch.cat(response_offsets, dim=0)
                 selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
                     draft_hidden=draft_hidden,
                     output_embeddings=output_embeddings,
@@ -1119,6 +1329,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 )
                 log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
                 loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
+                response_offsets_by_seq[response_batch_tensor, response_row_tensor] = response_offset_tensor
                 if entropy_by_seq is not None and selected_entropy is not None:
                     entropy_by_seq[response_batch_tensor, response_row_tensor] = selected_entropy
                 response_lm_token_count = response_batch_tensor.numel()
@@ -1193,6 +1404,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         output = {
             "dflash_log_probs": log_probs_by_seq,
             "dflash_loss_mask": loss_mask_by_seq,
+            "dflash_response_offsets": response_offsets_by_seq,
             "dflash_opd_valid_anchor_count": log_probs_by_seq.new_tensor(opd_metrics["valid_anchor_count"]),
             "dflash_opd_skipped_sample_count": log_probs_by_seq.new_tensor(opd_metrics["skipped_sample_count"]),
             "dflash_opd_empty_reject_sample_count": log_probs_by_seq.new_tensor(
@@ -1237,6 +1449,25 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         if entropy_by_seq is not None:
             output["dflash_entropy"] = entropy_by_seq
+        if use_replay_dis:
+            output.update(
+                self._compute_replay_dis_mismatch(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    target_hidden=target_hidden,
+                    target_lm_hidden=target_lm_hidden,
+                    output_embeddings=output_embeddings,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=response_lengths,
+                    replay_block_anchor_indices=replay_block_anchor_indices,
+                    replay_block_accepted_lengths=replay_block_accepted_lengths,
+                    replay_block_drafted_lengths=replay_block_drafted_lengths,
+                    replay_block_mask=replay_block_mask,
+                    draft_block_size=draft_block_size,
+                    lm_head_chunk_size=lm_head_chunk_size,
+                    profile_enabled=profile_enabled,
+                )
+            )
         return output
 
     def forward(
@@ -1258,6 +1489,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         dflash_rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         dflash_rejected_draft_mask: Optional[torch.Tensor] = None,
         dflash_calculate_entropy: bool = False,
+        dflash_use_replay_dis: bool = False,
+        dflash_replay_block_anchor_indices: Optional[torch.LongTensor] = None,
+        dflash_replay_block_accepted_lengths: Optional[torch.LongTensor] = None,
+        dflash_replay_block_drafted_lengths: Optional[torch.LongTensor] = None,
+        dflash_replay_block_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if input_ids is None and inputs_embeds is None:
@@ -1281,6 +1517,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 rejected_draft_teacher_logprobs=dflash_rejected_draft_teacher_logprobs,
                 rejected_draft_mask=dflash_rejected_draft_mask,
                 calculate_entropy=bool(dflash_calculate_entropy),
+                use_replay_dis=bool(dflash_use_replay_dis),
+                replay_block_anchor_indices=dflash_replay_block_anchor_indices,
+                replay_block_accepted_lengths=dflash_replay_block_accepted_lengths,
+                replay_block_drafted_lengths=dflash_replay_block_drafted_lengths,
+                replay_block_mask=dflash_replay_block_mask,
                 **kwargs,
             )
 
