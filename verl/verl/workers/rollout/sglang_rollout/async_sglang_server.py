@@ -679,7 +679,11 @@ class SGLangHttpServer:
             "response_token_ids": list(token_ids),
             "prompt_text": prompt_text,
             "response_text": response_text,
-            "sample_text": prompt_text + response_text if prompt_text is not None and response_text is not None else None,
+            "sample_text": (
+                prompt_text + response_text
+                if prompt_text is not None and response_text is not None
+                else None
+            ),
         }
         log_path = _repo_root() / "logs" / _safe_experiment_path(experiment_name) / "outlier.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)

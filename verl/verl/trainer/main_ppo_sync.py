@@ -1408,12 +1408,22 @@ class PPOTrainer:
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
+            and not bool(getattr(self.distillation_config.distillation_loss, "use_tv_loss", False))
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
+            "opd_use_tv_loss": bool(
+                getattr(self.distillation_config.distillation_loss, "use_tv_loss", False)
+            ),
+            "opd_rejected_draft_first_token_only": bool(
+                getattr(self.distillation_config.distillation_loss, "rejected_draft_first_token_only", False)
+            ),
+            "opd_use_task_rewards": bool(
+                getattr(self.distillation_config.distillation_loss, "use_task_rewards", False)
+            ),
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,

@@ -34,6 +34,8 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode (str):
         Distillation loss function to use.
+    use_tv_loss (bool):
+        Whether composed DFLASH uses exact full-vocabulary end-to-end total-variation loss.
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
     use_task_rewards (bool):
@@ -84,6 +86,7 @@ class DistillationLossConfig(BaseConfig):
     """
 
     loss_mode: str = "k3"
+    use_tv_loss: bool = False
     topk: Optional[int] = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
@@ -120,15 +123,27 @@ class DistillationLossConfig(BaseConfig):
         self._mutable_fields.add("loss_settings")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
-        self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+        settings_loss_mode = "k3" if self.use_tv_loss else self.loss_mode
+        self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(settings_loss_mode)
 
-        if self.reverse_kl_weight < 0:
+        if self.use_tv_loss and self.use_policy_gradient:
+            raise NotImplementedError(
+                "Exact DFLASH TV loss only supports direct supervised distillation "
+                "(use_policy_gradient=False)."
+            )
+
+        if not self.use_tv_loss and self.reverse_kl_weight < 0:
             raise ValueError(f"reverse_kl_weight must be non-negative, got {self.reverse_kl_weight}.")
-        if self.forward_kl_weight < 0:
+        if not self.use_tv_loss and self.forward_kl_weight < 0:
             raise ValueError(f"forward_kl_weight must be non-negative, got {self.forward_kl_weight}.")
-        if self.loss_mode != "forward_kl_topk" and self.reverse_kl_weight == 0 and self.forward_kl_weight == 0:
+        if (
+            not self.use_tv_loss
+            and self.loss_mode != "forward_kl_topk"
+            and self.reverse_kl_weight == 0
+            and self.forward_kl_weight == 0
+        ):
             raise ValueError("At least one of reverse_kl_weight or forward_kl_weight must be positive.")
-        if self.use_policy_gradient and self.forward_kl_weight > 0:
+        if not self.use_tv_loss and self.use_policy_gradient and self.forward_kl_weight > 0:
             raise NotImplementedError(
                 "forward_kl_weight > 0 is only supported for direct supervised distillation "
                 "(use_policy_gradient=False)."
@@ -148,7 +163,12 @@ class DistillationLossConfig(BaseConfig):
                 "should move) is largely unused."
             )
 
-        if not self.use_policy_gradient and self.loss_mode == "k1" and self.reverse_kl_weight > 0:
+        if (
+            not self.use_tv_loss
+            and not self.use_policy_gradient
+            and self.loss_mode == "k1"
+            and self.reverse_kl_weight > 0
+        ):
             raise ValueError(
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."

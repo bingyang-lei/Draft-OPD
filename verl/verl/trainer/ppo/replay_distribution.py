@@ -148,7 +148,10 @@ class ReplayDistributionTracker:
         drafted_lengths = _normalize_nested(
             non_tensor.get("dflash_replay_block_drafted_lengths"), batch_size, cast_fn=int
         )
-        if "dflash_replay_block_accepted_lengths" not in non_tensor or "dflash_replay_block_drafted_lengths" not in non_tensor:
+        if (
+            "dflash_replay_block_accepted_lengths" not in non_tensor
+            or "dflash_replay_block_drafted_lengths" not in non_tensor
+        ):
             raise RuntimeError(
                 "use_replay_dis=True requires DFLASH per-block metadata "
                 "(dflash_replay_block_accepted_lengths and dflash_replay_block_drafted_lengths)."

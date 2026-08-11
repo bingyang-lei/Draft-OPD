@@ -991,6 +991,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
     def _is_composed_dflash_module(self) -> bool:
         return self._is_composed_opd_draft_module()
 
+    def _is_exact_composed_dflash_module(self) -> bool:
+        module = getattr(self, "module", None)
+        while module is not None and hasattr(module, "module"):
+            module = module.module
+        return module is not None and module.__class__.__name__ == "ComposedDFlashStudentForCausalLM"
+
     def _get_dflash_rejected_draft_max_tokens_per_sample(self) -> Optional[int]:
         value = getattr(self.model_config.hf_config, "verl_dflash_rejected_draft_max_tokens_per_sample", None)
         if value is None:
@@ -1088,9 +1094,93 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 selected_count += 1
         return total_weight
 
+    @classmethod
+    def _count_dflash_tv_blocks(cls, data: TensorDict) -> int:
+        batch_size = int(data.batch_size[0])
+        response_mask = data.get("response_mask")
+        responses = data.get("responses")
+        if response_mask is not None:
+            if response_mask.is_nested:
+                response_lengths = response_mask.offsets().diff().tolist()
+            else:
+                response_lengths = response_mask.long().sum(dim=1).tolist()
+        elif responses is not None and responses.is_nested:
+            response_lengths = responses.offsets().diff().tolist()
+        elif responses is not None:
+            response_lengths = [int(responses.shape[1])] * batch_size
+        else:
+            raise ValueError("Exact DFLASH TV global block counting requires responses or response_mask.")
+
+        raw_rejects = tu.get_non_tensor_data(data=data, key="dflash_reject_token_indices", default=None)
+        reject_indices = cls._normalize_dflash_reject_indices(raw_rejects, batch_size=batch_size)
+        if not reject_indices:
+            reject_indices = [[] for _ in range(batch_size)]
+        raw_anchors = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_anchor_indices", default=None)
+        raw_offsets = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_offsets", default=None)
+        raw_token_ids = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_token_ids", default=None)
+        rejected_anchors = cls._normalize_dflash_rejected_draft_values(
+            raw_anchors, batch_size=batch_size, cast_fn=int
+        )
+        rejected_offsets = cls._normalize_dflash_rejected_draft_values(
+            raw_offsets, batch_size=batch_size, cast_fn=int
+        )
+        rejected_token_ids = cls._normalize_dflash_rejected_draft_values(
+            raw_token_ids, batch_size=batch_size, cast_fn=int
+        )
+
+        total = 0
+        for sample_idx in range(batch_size):
+            response_len = int(response_lengths[sample_idx])
+            anchors: set[int] = set()
+            rejects = sorted({idx for idx in reject_indices[sample_idx] if 0 <= idx < response_len})
+            if rejects:
+                boundaries = list(rejects)
+                if boundaries[-1] < response_len - 1:
+                    boundaries.append(response_len - 1)
+                response_anchors = [-1] + boundaries
+                for anchor, boundary in zip(response_anchors, boundaries, strict=False):
+                    if boundary > anchor:
+                        anchors.add(anchor)
+
+            lengths = {
+                len(rejected_anchors[sample_idx]),
+                len(rejected_offsets[sample_idx]),
+                len(rejected_token_ids[sample_idx]),
+            }
+            if len(lengths) != 1:
+                raise ValueError(
+                    "Rejected DFLASH TV metadata length mismatch while counting global blocks for "
+                    f"sample {sample_idx}: anchors={len(rejected_anchors[sample_idx])}, "
+                    f"offsets={len(rejected_offsets[sample_idx])}, "
+                    f"token_ids={len(rejected_token_ids[sample_idx])}."
+                )
+            for anchor, offset, token_id in zip(
+                rejected_anchors[sample_idx],
+                rejected_offsets[sample_idx],
+                rejected_token_ids[sample_idx],
+                strict=True,
+            ):
+                if token_id >= 0 and offset > 0 and (-1 <= anchor < response_len):
+                    anchors.add(anchor)
+            total += len(anchors)
+        return total
+
     def _compute_extra_global_batch_info(self, data: TensorDict) -> dict[str, float]:
         if not self._is_composed_dflash_module():
             return {}
+        if bool(tu.get_non_tensor_data(data=data, key="opd_use_tv_loss", default=False)):
+            if not self._is_exact_composed_dflash_module():
+                raise NotImplementedError(
+                    "use_tv_loss=True is only supported by ComposedDFlashStudentForCausalLM."
+                )
+            local_block_count = self._count_dflash_tv_blocks(data)
+            global_block_count = torch.tensor(
+                float(local_block_count), dtype=torch.float32, device=get_device_id()
+            )
+            torch.distributed.all_reduce(
+                global_block_count, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            return {"opd_tv_global_block_count": float(global_block_count.item())}
         raw_anchors = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_anchor_indices", default=None)
         raw_token_ids = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_token_ids", default=None)
         raw_offsets = tu.get_non_tensor_data(data=data, key="dflash_rejected_draft_offsets", default=None)
@@ -1213,7 +1303,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             sample_offsets = offsets[sample_idx] if sample_idx < len(offsets) else []
             sample_token_ids = token_ids[sample_idx]
             sample_teacher_logprobs = (
-                teacher_logprobs[sample_idx] if teacher_logprobs is not None and sample_idx < len(teacher_logprobs) else []
+                teacher_logprobs[sample_idx]
+                if teacher_logprobs is not None and sample_idx < len(teacher_logprobs)
+                else []
             )
             lengths = {len(sample_anchors), len(sample_offsets), len(sample_token_ids)}
             if teacher_logprobs is not None:
@@ -1289,7 +1381,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
         first_token_only = bool(
             tu.get_non_tensor_data(data=micro_batch, key="opd_rejected_draft_first_token_only", default=False)
         )
-        if first_token_only:
+        use_tv_loss = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_tv_loss", default=False))
+        # Exact TV validates and merges the complete suffix in the model. Keep the
+        # legacy pre-filtering behavior unchanged for sampled-KL training.
+        if first_token_only and not use_tv_loss:
             anchors, offsets, token_ids, teacher_logprobs = cls._filter_dflash_rejected_draft_first_tokens(
                 anchors=anchors,
                 offsets=offsets,
@@ -1568,6 +1663,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
 
         use_replay_dis = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_replay_dis", default=False))
+        use_tv_loss = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_tv_loss", default=False))
         model_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -1584,6 +1680,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 data=micro_batch, key="calculate_entropy", default=False
             ),
             "dflash_use_replay_dis": use_replay_dis,
+            "dflash_use_tv_loss": use_tv_loss,
+            "dflash_rejected_draft_first_token_only": bool(
+                tu.get_non_tensor_data(
+                    data=micro_batch, key="opd_rejected_draft_first_token_only", default=False
+                )
+            ),
+            "dflash_use_task_rewards": bool(
+                tu.get_non_tensor_data(data=micro_batch, key="opd_use_task_rewards", default=False)
+            ),
         }
         if use_replay_dis:
             model_inputs.update(
@@ -1740,6 +1845,75 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
         if output_args.get("dflash_opd", False):
+            tv_block_losses = (
+                output.get("dflash_tv_block_losses")
+                if isinstance(output, dict)
+                else getattr(output, "dflash_tv_block_losses", None)
+            )
+            if tv_block_losses is not None:
+                tv_keys = (
+                    "block_losses",
+                    "block_mask",
+                    "distance_sum",
+                    "overlap_sum",
+                    "expected_accept_length_sum",
+                    "block_count",
+                    "position_count",
+                    "teacher_branch_position_count",
+                )
+                model_output = {}
+                for suffix in tv_keys:
+                    source_key = f"dflash_tv_{suffix}"
+                    value = output.get(source_key) if isinstance(output, dict) else getattr(output, source_key, None)
+                    if value is None:
+                        raise RuntimeError(f"Exact DFLASH TV forward did not return {source_key}.")
+                    model_output[f"opd_tv_{suffix}"] = value
+                dflash_log_probs = output.get("dflash_log_probs") if isinstance(output, dict) else getattr(
+                    output, "dflash_log_probs", None
+                )
+                if dflash_log_probs is not None:
+                    dflash_loss_mask = output.get("dflash_loss_mask") if isinstance(output, dict) else getattr(
+                        output, "dflash_loss_mask", None
+                    )
+                    if dflash_loss_mask is None:
+                        raise RuntimeError("Task-reward DFLASH TV forward did not return dflash_loss_mask.")
+
+                    def _format_tv_sequence_output(sequence_output: torch.Tensor) -> torch.Tensor:
+                        input_ids = micro_batch["input_ids"]
+                        if input_ids.is_nested:
+                            seq_lens = input_ids.offsets().diff()
+                            values = torch.cat(
+                                [
+                                    sequence_output[i, : int(seq_lens[i].item())]
+                                    for i in range(seq_lens.numel())
+                                ],
+                                dim=0,
+                            )
+                            return torch.nested.nested_tensor_from_jagged(values, input_ids.offsets())
+                        attention_mask = micro_batch["attention_mask"]
+                        seq_lens = attention_mask.sum(dim=1).to(torch.long)
+                        return torch.cat(
+                            [
+                                sequence_output[i, : int(seq_lens[i].item())]
+                                for i in range(seq_lens.numel())
+                            ],
+                            dim=0,
+                        )
+
+                    model_output["log_probs"] = _format_tv_sequence_output(dflash_log_probs)
+                    model_output["opd_loss_mask"] = _format_tv_sequence_output(dflash_loss_mask)
+                    calculate_entropy = tu.get_non_tensor_data(
+                        data=micro_batch, key="calculate_entropy", default=False
+                    )
+                    if calculate_entropy:
+                        dflash_entropy = output.get("dflash_entropy") if isinstance(output, dict) else getattr(
+                            output, "dflash_entropy", None
+                        )
+                        if dflash_entropy is None:
+                            raise RuntimeError("Task-reward DFLASH TV forward did not return dflash_entropy.")
+                        model_output["entropy"] = _format_tv_sequence_output(dflash_entropy)
+                return model_output
+
             if isinstance(output, dict):
                 dflash_log_probs = output.get("dflash_log_probs")
                 dflash_entropy = output.get("dflash_entropy")
@@ -1997,7 +2171,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if key.startswith("replay_dis/") and isinstance(value, torch.Tensor) and value.dim() == 0:
                     metrics[key] = value.detach().float().item()
 
-            def keep_postprocess_model_output(value: object) -> bool:
+            def keep_postprocess_model_output(key: str, value: object) -> bool:
+                if key.startswith("opd_tv_"):
+                    return False
                 if not isinstance(value, torch.Tensor):
                     return False
                 # Scalar diagnostics are already represented in metrics. The engine
@@ -2008,7 +2184,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "model_output": {
                     key: value
                     for key, value in model_output.items()
-                    if keep_postprocess_model_output(value)
+                    if keep_postprocess_model_output(key, value)
                 },
                 "loss": loss.detach().item(),
                 "metrics": metrics,

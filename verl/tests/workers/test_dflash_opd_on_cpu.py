@@ -1,11 +1,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from tensordict import TensorDict
+from transformers import PretrainedConfig
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker
-from verl.models.transformers.dflash_student import ComposedDFlashStudentForCausalLM
+from verl.models.transformers.dflash_student import ComposedDFlashStudentForCausalLM, full_vocab_tv_distance
 from verl.models.transformers.eagle3_student import ComposedEagle3StudentForCausalLM, Eagle3DraftModel
 from verl.protocol import DataProto
 from verl.trainer.distillation.losses import (
@@ -15,9 +17,9 @@ from verl.trainer.distillation.losses import (
 )
 from verl.trainer.ppo.core_algos import kl_penalty
 from verl.utils import tensordict_utils as tu
+from verl.workers.config import DistillationLossConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.rollout.sglang_rollout.utils import align_dflash_reject_token_mask
-from transformers import PretrainedConfig
 
 
 def _single_sequence_logprobs(values):
@@ -1237,3 +1239,254 @@ def test_build_dflash_rejected_draft_tensors_filters_first_reject_per_anchor():
         torch.tensor([[-0.3, -0.2]], dtype=torch.float32),
     )
     assert tensors["dflash_rejected_draft_mask"].tolist() == [[True, True]]
+
+
+def test_build_dflash_rejected_draft_tensors_keeps_full_suffix_for_tv_validation():
+    batch = TensorDict({}, batch_size=[1])
+    tu.assign_non_tensor(
+        batch,
+        dflash_rejected_draft_anchor_indices=[[0, 0]],
+        dflash_rejected_draft_offsets=[[2, 3]],
+        dflash_rejected_draft_token_ids=[[10, 11]],
+        dflash_rejected_draft_teacher_logprobs=[[-0.2, -0.3]],
+        opd_rejected_draft_first_token_only=True,
+        opd_use_tv_loss=True,
+    )
+
+    tensors = FSDPEngineWithLMHead._build_dflash_rejected_draft_tensors(
+        micro_batch=batch,
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+
+    assert tensors["dflash_rejected_draft_offsets"].tolist() == [[2, 3]]
+    assert tensors["dflash_rejected_draft_mask"].tolist() == [[True, True]]
+
+
+def test_count_dflash_tv_blocks_unifies_response_and_rejected_anchors():
+    batch = TensorDict(
+        {
+            "responses": torch.tensor([[1, 2, 3, 4, 5]]),
+            "response_mask": torch.ones((1, 5), dtype=torch.long),
+        },
+        batch_size=[1],
+    )
+    tu.assign_non_tensor(
+        batch,
+        dflash_reject_token_indices=[[2]],
+        dflash_rejected_draft_anchor_indices=[[-1, 0]],
+        dflash_rejected_draft_offsets=[[3, 2]],
+        dflash_rejected_draft_token_ids=[[10, 11]],
+    )
+
+    # Response blocks have anchors -1 and 2; rejected anchor -1 merges with
+    # the first response block, while rejected anchor 0 adds one block.
+    assert FSDPEngineWithLMHead._count_dflash_tv_blocks(batch) == 3
+
+
+def test_full_vocab_tv_matches_manual_value_and_only_backpropagates_to_draft():
+    draft_logits = torch.tensor([[0.0, 1.0, -1.0]], requires_grad=True)
+    target_logits = torch.tensor([[1.0, -0.5, 0.25]], requires_grad=True)
+
+    tv = full_vocab_tv_distance(draft_logits, target_logits)
+    expected = 0.5 * (
+        torch.softmax(draft_logits.detach(), dim=-1) - torch.softmax(target_logits.detach(), dim=-1)
+    ).abs().sum(dim=-1)
+    assert torch.allclose(tv, expected)
+
+    tv.sum().backward()
+    assert draft_logits.grad is not None
+    assert torch.count_nonzero(draft_logits.grad).item() > 0
+    assert target_logits.grad is None
+
+
+def test_e2e_tv_uses_cumulative_overlap_instead_of_mean_token_tv():
+    tv = torch.tensor([0.2, 0.4], dtype=torch.float32, requires_grad=True)
+    losses, expected_lengths = ComposedDFlashStudentForCausalLM._compute_e2e_tv_block_outputs(
+        tv_distances=tv,
+        block_indices=torch.tensor([0, 0]),
+        block_count=1,
+    )
+
+    expected_length = torch.tensor(0.8 + 0.8 * 0.6)
+    expected_loss = 1.0 - expected_length / 2.0
+    assert torch.allclose(expected_lengths, expected_length.reshape(1))
+    assert torch.allclose(losses, expected_loss.reshape(1))
+    assert not torch.allclose(losses, tv.detach().mean().reshape(1))
+    losses.sum().backward()
+    assert tv.grad is not None
+
+
+def _tv_position_plan(*, first_token_only: bool, offsets=(2, 3), token_ids=(101, 102)):
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    return student._build_tv_position_plan(
+        prompt_lengths=torch.tensor([2]),
+        response_lengths=torch.tensor([6]),
+        anchor_positions=torch.tensor([[2]]),
+        segment_lens=torch.tensor([[4]]),
+        block_keep_mask=torch.tensor([[True]]),
+        valid_seq_lens=torch.tensor([8]),
+        draft_block_size=6,
+        rejected_draft_anchor_indices=torch.tensor([[0] * len(offsets)]),
+        rejected_draft_offsets=torch.tensor([list(offsets)]),
+        rejected_draft_token_ids=torch.tensor([list(token_ids)]),
+        rejected_draft_mask=torch.ones((1, len(offsets)), dtype=torch.bool),
+        first_token_only=first_token_only,
+    )
+
+
+def test_tv_position_plan_merges_accept_and_first_reject_without_residual_duplication():
+    plan = _tv_position_plan(first_token_only=True)
+
+    # offset 1 is accepted; offset 2 is the first rejected draft. The response
+    # residual at offset 2 and the later response offsets are not separate TV positions.
+    assert plan["offsets"].tolist() == [1, 2]
+    assert plan["draft_indices"].tolist() == [1, 2]
+    assert plan["target_row_indices"].tolist() == [2, 3]
+    assert plan["block_indices"].tolist() == [0, 0]
+    assert plan["block_count"] == 1
+    assert plan["branch_specs"] == []
+
+
+def test_tv_position_plan_selects_full_rejected_suffix_and_reindexes_one_block():
+    plan = _tv_position_plan(first_token_only=False)
+
+    assert plan["offsets"].tolist() == [1, 2, 3]
+    assert plan["block_indices"].tolist() == [0, 0, 0]
+    assert plan["target_row_indices"].tolist() == [2, 3, -1]
+    assert plan["branch_specs"][0]["flat_indices"] == [2]
+    assert plan["branch_specs"][0]["suffix_indices"] == [1]
+
+
+def test_tv_position_plan_rejects_conflicts_out_of_bounds_and_noncontiguous_suffixes():
+    with pytest.raises(ValueError, match="Conflicting duplicate"):
+        _tv_position_plan(first_token_only=False, offsets=(2, 2), token_ids=(101, 102))
+    with pytest.raises(ValueError, match="out of bounds"):
+        _tv_position_plan(first_token_only=False, offsets=(6,), token_ids=(101,))
+    with pytest.raises(ValueError, match="contiguous"):
+        _tv_position_plan(first_token_only=False, offsets=(2, 4), token_ids=(101, 102))
+
+
+def test_tv_position_plan_uses_all_response_offsets_without_rejected_metadata_and_handles_empty_blocks():
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    plan = student._build_tv_position_plan(
+        prompt_lengths=torch.tensor([2]),
+        response_lengths=torch.tensor([4]),
+        anchor_positions=torch.tensor([[1, 0]]),
+        segment_lens=torch.tensor([[3, 0]]),
+        block_keep_mask=torch.tensor([[True, False]]),
+        valid_seq_lens=torch.tensor([6]),
+        draft_block_size=5,
+        rejected_draft_anchor_indices=None,
+        rejected_draft_offsets=None,
+        rejected_draft_token_ids=None,
+        rejected_draft_mask=None,
+        first_token_only=True,
+    )
+    assert plan["offsets"].tolist() == [1, 2, 3]
+    assert plan["block_count"] == 1
+
+    empty = student._build_tv_position_plan(
+        prompt_lengths=torch.tensor([2]),
+        response_lengths=torch.tensor([0]),
+        anchor_positions=torch.tensor([[0]]),
+        segment_lens=torch.tensor([[0]]),
+        block_keep_mask=torch.tensor([[False]]),
+        valid_seq_lens=torch.tensor([2]),
+        draft_block_size=5,
+        rejected_draft_anchor_indices=None,
+        rejected_draft_offsets=None,
+        rejected_draft_token_ids=None,
+        rejected_draft_mask=None,
+        first_token_only=True,
+    )
+    assert empty["block_count"] == 0
+    assert empty["offsets"].numel() == 0
+
+
+def test_tv_later_rejected_position_uses_reconstructed_teacher_branch_context():
+    class _BranchTeacher:
+        def __call__(self, *, input_ids, **kwargs):
+            hidden = input_ids.float().cumsum(dim=1).unsqueeze(-1)
+            return SimpleNamespace(hidden_states=(hidden,))
+
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    student.main_model = _BranchTeacher()
+    plan = _tv_position_plan(first_token_only=False)
+    target_lm_hidden = torch.zeros((1, 8, 1), dtype=torch.float32)
+    selected, branch_count = student._compute_tv_teacher_branch_hidden(
+        input_ids=torch.tensor([[10, 11, 12, 13, 14, 15, 16, 17]]),
+        position_ids=torch.arange(8).unsqueeze(0),
+        target_lm_hidden=target_lm_hidden,
+        tv_plan=plan,
+    )
+
+    assert selected[:2].tolist() == [[0.0], [0.0]]
+    # prefix through token 13 followed by the first rejected token 101.
+    assert selected[2].item() == 10 + 11 + 12 + 13 + 101
+    assert branch_count == 1
+
+
+def _tv_loss_for_micro_batch(block_losses, *, global_block_count, dp_size=1):
+    block_losses = torch.tensor(block_losses, dtype=torch.float32, requires_grad=True)
+    block_count = float(block_losses.numel())
+    position_count = block_count * 2.0
+    model_output = {
+        "opd_tv_block_losses": block_losses,
+        "opd_tv_block_mask": torch.ones_like(block_losses, dtype=torch.bool),
+        "opd_tv_distance_sum": torch.tensor(position_count * 0.25),
+        "opd_tv_overlap_sum": torch.tensor(position_count * 0.75),
+        "opd_tv_expected_accept_length_sum": torch.tensor(block_count * 1.5),
+        "opd_tv_block_count": torch.tensor(block_count),
+        "opd_tv_position_count": torch.tensor(position_count),
+        "opd_tv_teacher_branch_position_count": torch.tensor(0.0),
+    }
+    config = SimpleNamespace(
+        loss_agg_mode="token-mean",
+        global_batch_info={"opd_tv_global_block_count": global_block_count, "dp_size": dp_size},
+    )
+    loss_config = SimpleNamespace(use_tv_loss=True, use_policy_gradient=False)
+    loss, metrics = distillation_loss(
+        config,
+        SimpleNamespace(distillation_loss=loss_config),
+        model_output,
+        TensorDict({}, batch_size=[]),
+    )
+    return loss, metrics
+
+
+def test_tv_block_mean_is_invariant_to_micro_batch_splits_and_dp_scaling():
+    loss_a, metrics = _tv_loss_for_micro_batch([0.2, 0.4], global_block_count=4)
+    loss_b, _ = _tv_loss_for_micro_batch([0.6, 0.8], global_block_count=4)
+    assert torch.allclose(loss_a + loss_b, torch.tensor(0.5))
+    assert metrics["distillation/tv_distance"].values == [0.25]
+    assert metrics["distillation/tv_overlap"].values == [0.75]
+
+    rank0, _ = _tv_loss_for_micro_batch([0.2, 0.4], global_block_count=4, dp_size=2)
+    rank1, _ = _tv_loss_for_micro_batch([0.6, 0.8], global_block_count=4, dp_size=2)
+    assert torch.allclose((rank0 + rank1) / 2.0, torch.tensor(0.5))
+
+
+def test_tv_mode_rejects_policy_gradient_and_non_composed_output():
+    with pytest.raises(NotImplementedError, match="direct supervised"):
+        DistillationLossConfig(use_tv_loss=True, use_policy_gradient=True)
+
+    ignored = DistillationLossConfig(
+        use_tv_loss=True,
+        use_policy_gradient=False,
+        loss_mode="ignored-by-exact-tv",
+        reverse_kl_weight=-1.0,
+        forward_kl_weight=-2.0,
+        loss_max_clamp=-3.0,
+    )
+    assert ignored.loss_settings.use_estimator
+
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+    loss_config = SimpleNamespace(use_tv_loss=True, use_policy_gradient=False)
+    with pytest.raises(NotImplementedError, match="composed DFLASH"):
+        distillation_loss(
+            config,
+            SimpleNamespace(distillation_loss=loss_config),
+            {},
+            TensorDict({}, batch_size=[]),
+        )
