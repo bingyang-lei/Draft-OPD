@@ -342,6 +342,12 @@ def distillation_ppo_loss(
 
     # Called as logits processor
     if student_logits is not None:
+        if distillation_config is not None and bool(
+            getattr(distillation_config.distillation_loss, "use_tv_loss", False)
+        ):
+            # Exact TV is computed inside the composed DFLASH forward from full
+            # teacher and draft distributions. Never run the legacy top-k path.
+            return {}
         if model_output is not None and get_rejected_draft_distillation_stream(model_output) is not None:
             raise NotImplementedError(
                 "DFLASH rejected draft token training is not supported with forward_kl_topk."
@@ -364,7 +370,12 @@ def distillation_ppo_loss(
     config.global_batch_info["opd_rejected_draft_batch_effective_num_tokens"] = tu.get_non_tensor_data(
         data=data, key="opd_rejected_draft_batch_effective_num_tokens", default=None
     )
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data, dp_group=dp_group)
+    config.global_batch_info["opd_tv_global_block_count"] = tu.get_non_tensor_data(
+        data=data, key="opd_tv_global_block_count", default=None
+    )
+    distill_loss, distill_metrics = distillation_loss(
+        config, distillation_config, model_output, data, dp_group=dp_group
+    )
     if not distillation_loss_config.use_task_rewards:
         distill_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
         return distill_loss, distill_metrics
@@ -586,6 +597,86 @@ def _agg_loss_global_batch_info(config: ActorConfig) -> dict[str, Any]:
     return {key: value for key, value in global_batch_info.items() if key in _AGG_LOSS_GLOBAL_BATCH_INFO_KEYS}
 
 
+def _exact_tv_distillation_loss(
+    *,
+    config: ActorConfig,
+    loss_config: DistillationLossConfig,
+    model_output: dict,
+    dp_group=None,
+) -> tuple[torch.Tensor, dict[str, Metric]]:
+    if loss_config.use_policy_gradient:
+        raise NotImplementedError(
+            "Exact DFLASH TV loss only supports direct supervised distillation "
+            "(use_policy_gradient=False)."
+        )
+    block_losses = model_output.get("opd_tv_block_losses")
+    block_mask = model_output.get("opd_tv_block_mask")
+    if block_losses is None or block_mask is None:
+        raise NotImplementedError(
+            "use_tv_loss=True requires a composed DFLASH student forward that returns exact TV blocks."
+        )
+    block_mask = block_mask.bool()
+    if block_losses.shape != block_mask.shape:
+        raise ValueError(
+            "Exact DFLASH TV block loss/mask shape mismatch: "
+            f"losses={tuple(block_losses.shape)}, mask={tuple(block_mask.shape)}."
+        )
+
+    valid_block_losses = block_losses[block_mask]
+    local_block_sum = valid_block_losses.sum() if valid_block_losses.numel() else block_losses.sum() * 0.0
+    local_block_count = block_mask.sum().to(dtype=torch.float32)
+    global_batch_info = getattr(config, "global_batch_info", {}) or {}
+    global_block_count = global_batch_info.get("opd_tv_global_block_count")
+    if global_block_count is None:
+        global_block_count = _global_sum(local_block_count, dp_group)
+    denom = _scalar_like(global_block_count, local_block_sum)
+    if denom.item() <= 0:
+        loss = local_block_sum * 0.0
+    else:
+        loss = local_block_sum / denom
+        loss = loss * _scalar_like(global_batch_info.get("dp_size", 1), loss)
+
+    def _required_scalar(name: str) -> torch.Tensor:
+        value = model_output.get(name)
+        if value is None:
+            raise RuntimeError(f"Exact DFLASH TV forward did not return {name}.")
+        if not isinstance(value, torch.Tensor):
+            value = local_block_sum.new_tensor(float(value))
+        if value.numel() != 1:
+            raise ValueError(f"Exact DFLASH TV statistic {name} must be scalar, got {tuple(value.shape)}.")
+        return value.detach().to(device=local_block_sum.device, dtype=torch.float32)
+
+    distance_sum = _required_scalar("opd_tv_distance_sum")
+    overlap_sum = _required_scalar("opd_tv_overlap_sum")
+    expected_length_sum = _required_scalar("opd_tv_expected_accept_length_sum")
+    reported_block_count = _required_scalar("opd_tv_block_count")
+    position_count = _required_scalar("opd_tv_position_count")
+    branch_position_count = _required_scalar("opd_tv_teacher_branch_position_count")
+    zero = local_block_sum.detach().new_tensor(0.0)
+    mean_distance = torch.where(position_count > 0, distance_sum / position_count.clamp_min(1.0), zero)
+    mean_overlap = torch.where(position_count > 0, overlap_sum / position_count.clamp_min(1.0), zero)
+    expected_length_contribution = zero
+    if denom.item() > 0:
+        expected_length_contribution = expected_length_sum / denom
+        expected_length_contribution = expected_length_contribution * _scalar_like(
+            global_batch_info.get("dp_size", 1), expected_length_contribution
+        )
+    metrics = {
+        "distillation/e2e_tv_loss": Metric(AggregationType.SUM, loss.detach()),
+        "distillation/tv_distance": Metric(AggregationType.MEAN, mean_distance),
+        "distillation/tv_overlap": Metric(AggregationType.MEAN, mean_overlap),
+        "distillation/e2e_expected_accept_length": Metric(
+            AggregationType.SUM, expected_length_contribution
+        ),
+        "distillation/tv_block_count": Metric(AggregationType.SUM, reported_block_count),
+        "distillation/tv_position_count": Metric(AggregationType.SUM, position_count),
+        "distillation/tv_teacher_branch_position_count": Metric(
+            AggregationType.SUM, branch_position_count
+        ),
+    }
+    return loss, metrics
+
+
 def distillation_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -602,6 +693,13 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    if bool(getattr(loss_config, "use_tv_loss", False)):
+        return _exact_tv_distillation_loss(
+            config=config,
+            loss_config=loss_config,
+            model_output=model_output,
+            dp_group=dp_group,
+        )
     rejected_draft_stream = get_rejected_draft_distillation_stream(model_output)
     if rejected_draft_stream is not None and loss_config.loss_mode == "forward_kl_topk":
         raise NotImplementedError("DFLASH rejected draft token training is not supported with forward_kl_topk.")
@@ -797,7 +895,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk"], use_topk=True)  # type: ignore[arg-type]
+)
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,

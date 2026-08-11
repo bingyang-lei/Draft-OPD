@@ -23,6 +23,9 @@ distillation_loss:
   # Loss function mode for distillation
   loss_mode: k3
 
+  # Use exact full-vocabulary end-to-end TV loss for a composed DFLASH student.
+  use_tv_loss: false
+
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
 

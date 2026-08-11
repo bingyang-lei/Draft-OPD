@@ -1427,12 +1427,15 @@ class RayPPOTrainer:
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
+            and not bool(getattr(self.distillation_config.distillation_loss, "use_tv_loss", False))
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
         rejected_draft_position_decay_enabled = False
         rejected_draft_position_decay = 1.0
         rejected_draft_first_token_only = False
+        use_tv_loss = False
+        use_task_rewards = False
         if is_distillation_enabled(self.config.get("distillation")) and self.distillation_config is not None:
             loss_config = self.distillation_config.distillation_loss
             rejected_draft_position_decay_enabled = bool(
@@ -1440,6 +1443,8 @@ class RayPPOTrainer:
             )
             rejected_draft_position_decay = float(getattr(loss_config, "rejected_draft_position_decay", 0.9))
             rejected_draft_first_token_only = bool(getattr(loss_config, "rejected_draft_first_token_only", False))
+            use_tv_loss = bool(getattr(loss_config, "use_tv_loss", False))
+            use_task_rewards = bool(getattr(loss_config, "use_task_rewards", False))
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         if effective_mini_batch_size is not None:
@@ -1459,6 +1464,8 @@ class RayPPOTrainer:
             opd_rejected_draft_position_decay_enabled=rejected_draft_position_decay_enabled,
             opd_rejected_draft_position_decay=rejected_draft_position_decay,
             opd_rejected_draft_first_token_only=rejected_draft_first_token_only,
+            opd_use_tv_loss=use_tv_loss,
+            opd_use_task_rewards=use_task_rewards,
             compute_loss=True,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
@@ -1737,8 +1744,7 @@ class RayPPOTrainer:
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # In rollout-speed-test mode, run speed validation only on test_freq boundaries.
-        if self.config.trainer.get("val_before_train", True) and not self.rollout_speed_test_only:
+        if self.config.trainer.get("val_before_train", True):
             val_metrics = self._run_initial_validation_repeats()
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
@@ -1907,8 +1913,9 @@ class RayPPOTrainer:
 
                         # Operating Mode Selection:
                         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                        # - Decoupled mode: Recomputes old_log_probs as proximal anchor
+                        #   (3 policies: π_rollout, π_old, π_θ). π_old is computed once per data batch
+                        #   and serves as a stable reference during mini-batch updates.
                         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get(
                             "bypass_mode", False

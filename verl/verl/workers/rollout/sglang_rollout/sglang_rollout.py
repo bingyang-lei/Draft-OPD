@@ -101,7 +101,9 @@ async def _update_weights_with_optional_draft_flag(
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
         request_kwargs = {
-            "serialized_named_tensors": [MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)],
+            "serialized_named_tensors": [
+                MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
+            ],
             "load_format": load_format,
         }
         if (

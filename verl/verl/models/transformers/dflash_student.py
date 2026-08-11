@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional, cast
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 logger = logging.getLogger(__file__)
@@ -35,6 +35,22 @@ DFLASH_ATTENTION_IMPL_IDS = {
     "sdpa": 1,
     "flex_attention": 2,
 }
+
+
+def full_vocab_tv_distance(draft_logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
+    """Compute exact total-variation distance in FP32.
+
+    The target distribution is deliberately detached so gradients can only flow
+    through the draft distribution.
+    """
+    if draft_logits.shape != target_logits.shape:
+        raise ValueError(
+            "Draft and target logits must have identical shapes for full-vocabulary TV, got "
+            f"draft={tuple(draft_logits.shape)}, target={tuple(target_logits.shape)}."
+        )
+    draft_probs = F.softmax(draft_logits.float(), dim=-1)
+    target_probs = F.softmax(target_logits.detach().float(), dim=-1)
+    return 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -56,16 +72,16 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> lis
 
 
 def resolve_target_layer_ids(main_model: PreTrainedModel, draft_model: PreTrainedModel) -> list[int]:
-    if hasattr(draft_model, "target_layer_ids") and getattr(draft_model, "target_layer_ids") is not None:
-        return [int(layer_id) for layer_id in getattr(draft_model, "target_layer_ids")]
+    if hasattr(draft_model, "target_layer_ids") and draft_model.target_layer_ids is not None:
+        return [int(layer_id) for layer_id in draft_model.target_layer_ids]
 
     draft_config = getattr(draft_model, "config", None)
     dflash_config = getattr(draft_config, "dflash_config", None) if draft_config is not None else None
     if isinstance(dflash_config, dict) and dflash_config.get("target_layer_ids") is not None:
         return [int(layer_id) for layer_id in dflash_config["target_layer_ids"]]
 
-    num_target_layers = int(getattr(main_model.config, "num_hidden_layers"))
-    num_draft_layers = int(getattr(draft_model.config, "num_hidden_layers"))
+    num_target_layers = int(main_model.config.num_hidden_layers)
+    num_draft_layers = int(draft_model.config.num_hidden_layers)
     return build_target_layer_ids(num_target_layers=num_target_layers, num_draft_layers=num_draft_layers)
 
 
@@ -229,9 +245,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         gradient_checkpointing_func: Optional[Callable[..., Any]] = None,
     ):
         """HF hook for toggling gradient checkpointing support."""
-        setattr(self, "gradient_checkpointing", enable)
+        self.gradient_checkpointing = enable
         if hasattr(self, "config"):
-            setattr(self.config, "gradient_checkpointing", enable)
+            self.config.gradient_checkpointing = enable
 
         for child in (self.main_model, self.draft_model):
             if hasattr(child, "_set_gradient_checkpointing"):
@@ -247,9 +263,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     # Compatibility for older HF-style signatures used by some remote-code models.
                     child._set_gradient_checkpointing(enable)
             else:
-                setattr(child, "gradient_checkpointing", enable)
+                child.gradient_checkpointing = enable
                 if hasattr(child, "config"):
-                    setattr(child.config, "gradient_checkpointing", enable)
+                    child.config.gradient_checkpointing = enable
 
     def get_input_embeddings(self):
         return self.main_model.get_input_embeddings()
@@ -1004,6 +1020,331 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             student_tensor[selected_item_batch_indices, selected_item_column_indices] = selected_log_probs
         return student_tensor, teacher_tensor, mask_tensor
 
+    def _build_tv_position_plan(
+        self,
+        *,
+        prompt_lengths: torch.LongTensor,
+        response_lengths: torch.LongTensor,
+        anchor_positions: torch.LongTensor,
+        segment_lens: torch.LongTensor,
+        block_keep_mask: torch.Tensor,
+        valid_seq_lens: torch.LongTensor,
+        draft_block_size: int,
+        rejected_draft_anchor_indices: Optional[torch.LongTensor],
+        rejected_draft_offsets: Optional[torch.LongTensor],
+        rejected_draft_token_ids: Optional[torch.LongTensor],
+        rejected_draft_mask: Optional[torch.Tensor],
+        first_token_only: bool,
+    ) -> dict[str, Any]:
+        """Merge accepted and rejected positions into exact speculative blocks.
+
+        Positions are keyed by ``(sample, anchor, offset)``. Rejected metadata
+        replaces the target-trajectory residual at the same offset, so every
+        original speculative position appears at most once.
+        """
+        device = anchor_positions.device
+        batch_size = int(prompt_lengths.shape[0])
+        rejected_by_sample_anchor: list[dict[int, dict[int, int]]] = [dict() for _ in range(batch_size)]
+
+        rejected_tensors = (
+            rejected_draft_anchor_indices,
+            rejected_draft_offsets,
+            rejected_draft_token_ids,
+            rejected_draft_mask,
+        )
+        present = [tensor is not None for tensor in rejected_tensors]
+        if any(present) and not all(present):
+            raise ValueError(
+                "Exact DFLASH TV requires anchor, offset, token-id, and mask rejected metadata together."
+            )
+        if all(present):
+            assert rejected_draft_anchor_indices is not None
+            assert rejected_draft_offsets is not None
+            assert rejected_draft_token_ids is not None
+            assert rejected_draft_mask is not None
+            expected_shape = rejected_draft_mask.shape
+            for name, tensor in (
+                ("anchor_indices", rejected_draft_anchor_indices),
+                ("offsets", rejected_draft_offsets),
+                ("token_ids", rejected_draft_token_ids),
+            ):
+                if tensor.shape != expected_shape:
+                    raise ValueError(
+                        f"Rejected DFLASH TV metadata shape mismatch for {name}: "
+                        f"{tuple(tensor.shape)} != {tuple(expected_shape)}."
+                    )
+            for batch_idx in range(batch_size):
+                prompt_len = int(prompt_lengths[batch_idx].item())
+                valid_len = int(valid_seq_lens[batch_idx].item())
+                for item_idx in range(int(rejected_draft_mask.shape[1])):
+                    if not bool(rejected_draft_mask[batch_idx, item_idx].item()):
+                        continue
+                    anchor_resp = int(rejected_draft_anchor_indices[batch_idx, item_idx].item())
+                    full_anchor = prompt_len - 1 if anchor_resp < 0 else prompt_len + anchor_resp
+                    offset = int(rejected_draft_offsets[batch_idx, item_idx].item())
+                    token_id = int(rejected_draft_token_ids[batch_idx, item_idx].item())
+                    if full_anchor < 0 or full_anchor >= valid_len:
+                        raise ValueError(
+                            "Rejected DFLASH TV anchor is out of bounds: "
+                            f"sample={batch_idx}, anchor={anchor_resp}, full_anchor={full_anchor}, "
+                            f"valid_len={valid_len}."
+                        )
+                    if offset <= 0 or offset >= draft_block_size:
+                        raise ValueError(
+                            "Rejected DFLASH TV offset is out of bounds: "
+                            f"sample={batch_idx}, anchor={anchor_resp}, offset={offset}, "
+                            f"draft_block_size={draft_block_size}."
+                        )
+                    if token_id < 0:
+                        raise ValueError(
+                            "Rejected DFLASH TV token id must be non-negative: "
+                            f"sample={batch_idx}, anchor={anchor_resp}, offset={offset}, token_id={token_id}."
+                        )
+                    by_offset = rejected_by_sample_anchor[batch_idx].setdefault(full_anchor, {})
+                    previous_token_id = by_offset.get(offset)
+                    if previous_token_id is not None and previous_token_id != token_id:
+                        raise ValueError(
+                            "Conflicting duplicate rejected DFLASH TV metadata at "
+                            f"sample={batch_idx}, anchor={anchor_resp}, offset={offset}: "
+                            f"token_ids={previous_token_id} and {token_id}."
+                        )
+                    by_offset[offset] = token_id
+
+        for batch_idx, rejected_by_anchor in enumerate(rejected_by_sample_anchor):
+            valid_len = int(valid_seq_lens[batch_idx].item())
+            for full_anchor, by_offset in rejected_by_anchor.items():
+                sorted_offsets = sorted(by_offset)
+                expected_offsets = list(range(sorted_offsets[0], sorted_offsets[-1] + 1))
+                if sorted_offsets != expected_offsets:
+                    raise ValueError(
+                        "Rejected DFLASH TV suffix offsets must be contiguous: "
+                        f"sample={batch_idx}, full_anchor={full_anchor}, offsets={sorted_offsets}."
+                    )
+                first_offset = sorted_offsets[0]
+                first_target_row = full_anchor + first_offset - 1
+                if first_target_row >= valid_len:
+                    raise ValueError(
+                        "Rejected DFLASH TV first-reject context exceeds the target trajectory: "
+                        f"sample={batch_idx}, full_anchor={full_anchor}, first_offset={first_offset}, "
+                        f"target_row={first_target_row}, valid_len={valid_len}."
+                    )
+
+        batch_indices: list[int] = []
+        draft_indices: list[int] = []
+        target_row_indices: list[int] = []
+        block_indices: list[int] = []
+        offsets: list[int] = []
+        branch_specs: list[dict[str, Any]] = []
+        seen_anchors: set[tuple[int, int]] = set()
+        effective_block_idx = 0
+
+        for batch_idx in range(batch_size):
+            for anchor_block_idx in range(int(anchor_positions.shape[1])):
+                if not bool(block_keep_mask[batch_idx, anchor_block_idx].item()):
+                    continue
+                full_anchor = int(anchor_positions[batch_idx, anchor_block_idx].item())
+                anchor_key = (batch_idx, full_anchor)
+                if anchor_key in seen_anchors:
+                    raise ValueError(
+                        "Duplicate DFLASH TV anchor plan entry for "
+                        f"sample={batch_idx}, full_anchor={full_anchor}."
+                    )
+                seen_anchors.add(anchor_key)
+                rejected_by_offset = rejected_by_sample_anchor[batch_idx].get(full_anchor)
+                branch_spec: Optional[dict[str, Any]] = None
+                if rejected_by_offset:
+                    rejected_offsets = sorted(rejected_by_offset)
+                    first_rejected_offset = rejected_offsets[0]
+                    selected_rejected_offsets = rejected_offsets[:1] if first_token_only else rejected_offsets
+                    selected_offsets = list(range(1, first_rejected_offset)) + selected_rejected_offsets
+                    if not first_token_only and len(rejected_offsets) > 1:
+                        branch_spec = {
+                            "sample_idx": batch_idx,
+                            "full_anchor": full_anchor,
+                            "first_offset": first_rejected_offset,
+                            "token_ids": [rejected_by_offset[offset] for offset in rejected_offsets],
+                            "flat_indices": [],
+                            "suffix_indices": [],
+                        }
+                else:
+                    segment_len = int(segment_lens[batch_idx, anchor_block_idx].item())
+                    selected_offsets = list(range(1, segment_len + 1))
+
+                if not selected_offsets:
+                    continue
+                for offset in selected_offsets:
+                    target_row = full_anchor + offset - 1
+                    is_later_reject = bool(
+                        rejected_by_offset
+                        and offset > min(rejected_by_offset)
+                        and offset in rejected_by_offset
+                    )
+                    if not is_later_reject and target_row >= int(valid_seq_lens[batch_idx].item()):
+                        raise ValueError(
+                            "DFLASH TV target-trajectory position is out of bounds: "
+                            f"sample={batch_idx}, full_anchor={full_anchor}, offset={offset}, "
+                            f"target_row={target_row}, valid_len={int(valid_seq_lens[batch_idx].item())}."
+                        )
+                    flat_idx = len(batch_indices)
+                    batch_indices.append(batch_idx)
+                    draft_indices.append(anchor_block_idx * draft_block_size + offset)
+                    target_row_indices.append(-1 if is_later_reject else target_row)
+                    block_indices.append(effective_block_idx)
+                    offsets.append(offset)
+                    if is_later_reject:
+                        assert branch_spec is not None
+                        branch_spec["flat_indices"].append(flat_idx)
+                        branch_spec["suffix_indices"].append(offset - int(branch_spec["first_offset"]))
+                if branch_spec is not None:
+                    branch_specs.append(branch_spec)
+                effective_block_idx += 1
+
+        missing_rejected_anchors = {
+            (batch_idx, full_anchor)
+            for batch_idx, by_anchor in enumerate(rejected_by_sample_anchor)
+            for full_anchor in by_anchor
+            if (batch_idx, full_anchor) not in seen_anchors
+        }
+        if missing_rejected_anchors:
+            raise ValueError(
+                "Rejected DFLASH TV metadata anchors are missing from the draft anchor plan: "
+                f"{sorted(missing_rejected_anchors)}."
+            )
+
+        def _long_tensor(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.long, device=device)
+
+        return {
+            "batch_indices": _long_tensor(batch_indices),
+            "draft_indices": _long_tensor(draft_indices),
+            "target_row_indices": _long_tensor(target_row_indices),
+            "block_indices": _long_tensor(block_indices),
+            "offsets": _long_tensor(offsets),
+            "branch_specs": branch_specs,
+            "block_count": effective_block_idx,
+        }
+
+    def _compute_tv_teacher_branch_hidden(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        position_ids: Optional[torch.LongTensor],
+        target_lm_hidden: torch.Tensor,
+        tv_plan: dict[str, Any],
+    ) -> tuple[torch.Tensor, int]:
+        target_rows = tv_plan["target_row_indices"]
+        if target_rows.numel() == 0:
+            return target_lm_hidden.new_empty((0, target_lm_hidden.shape[-1])), 0
+        safe_rows = target_rows.clamp_min(0)
+        selected = target_lm_hidden[tv_plan["batch_indices"], safe_rows].detach().clone()
+        branch_position_count = 0
+        for branch_spec in tv_plan["branch_specs"]:
+            sample_idx = int(branch_spec["sample_idx"])
+            full_anchor = int(branch_spec["full_anchor"])
+            first_offset = int(branch_spec["first_offset"])
+            prefix_len = full_anchor + first_offset
+            branch_tokens = torch.tensor(
+                branch_spec["token_ids"], dtype=input_ids.dtype, device=input_ids.device
+            )
+            branch_input_ids = torch.cat([input_ids[sample_idx, :prefix_len], branch_tokens], dim=0).unsqueeze(0)
+            branch_attention_mask = torch.ones_like(branch_input_ids, dtype=torch.long)
+            branch_position_ids = None
+            if position_ids is not None:
+                if position_ids.dim() != 2:
+                    raise NotImplementedError(
+                        "Exact DFLASH TV rejected-branch reconstruction currently supports 2D text position_ids only."
+                    )
+                branch_position_ids = torch.arange(
+                    branch_input_ids.shape[1], dtype=position_ids.dtype, device=position_ids.device
+                ).unsqueeze(0)
+            with torch.no_grad():
+                branch_outputs = self.main_model(
+                    input_ids=branch_input_ids,
+                    attention_mask=branch_attention_mask,
+                    position_ids=branch_position_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                if branch_outputs.hidden_states is None:
+                    raise RuntimeError("Teacher branch forward did not return hidden states for exact DFLASH TV.")
+                branch_hidden = branch_outputs.hidden_states[-1]
+            flat_indices = torch.tensor(branch_spec["flat_indices"], dtype=torch.long, device=input_ids.device)
+            suffix_indices = torch.tensor(branch_spec["suffix_indices"], dtype=torch.long, device=input_ids.device)
+            branch_rows = prefix_len - 1 + suffix_indices
+            selected[flat_indices] = branch_hidden[0, branch_rows].detach()
+            branch_position_count += int(flat_indices.numel())
+        return selected, branch_position_count
+
+    def _compute_full_vocab_tv_from_hidden(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        target_hidden: torch.Tensor,
+        output_embeddings: torch.nn.Module,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        if draft_hidden.shape != target_hidden.shape:
+            raise ValueError(
+                "Draft and target hidden states must have identical shapes for exact DFLASH TV, got "
+                f"draft={tuple(draft_hidden.shape)}, target={tuple(target_hidden.shape)}."
+            )
+        if draft_hidden.numel() == 0:
+            return draft_hidden.new_empty((0,), dtype=torch.float32)
+
+        def _linear_with_frozen_head(hidden: torch.Tensor) -> torch.Tensor:
+            if isinstance(output_embeddings, torch.nn.Linear):
+                bias = output_embeddings.bias.detach() if output_embeddings.bias is not None else None
+                return F.linear(hidden, output_embeddings.weight.detach(), bias)
+            if any(param.requires_grad for param in output_embeddings.parameters()):
+                raise RuntimeError("Exact DFLASH TV requires a frozen target LM head.")
+            return output_embeddings(hidden)
+
+        tv_chunks: list[torch.Tensor] = []
+        for start in range(0, int(draft_hidden.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(draft_hidden.shape[0]))
+            draft_chunk = draft_hidden[start:end]
+            target_chunk = target_hidden[start:end]
+
+            def _tv_chunk(draft_arg: torch.Tensor, target_arg: torch.Tensor) -> torch.Tensor:
+                draft_logits = _linear_with_frozen_head(draft_arg)
+                with torch.no_grad():
+                    target_logits = _linear_with_frozen_head(target_arg)
+                return full_vocab_tv_distance(draft_logits, target_logits)
+
+            if torch.is_grad_enabled() and draft_chunk.requires_grad:
+                tv_chunk = torch_checkpoint.checkpoint(
+                    _tv_chunk,
+                    draft_chunk,
+                    target_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                tv_chunk = _tv_chunk(draft_chunk, target_chunk)
+            tv_chunks.append(tv_chunk)
+        return torch.cat(tv_chunks, dim=0)
+
+    @staticmethod
+    def _compute_e2e_tv_block_outputs(
+        tv_distances: torch.Tensor,
+        block_indices: torch.LongTensor,
+        block_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        block_losses: list[torch.Tensor] = []
+        expected_accept_lengths: list[torch.Tensor] = []
+        for block_idx in range(block_count):
+            block_tv = tv_distances[block_indices == block_idx]
+            if block_tv.numel() == 0:
+                raise RuntimeError(f"Exact DFLASH TV block {block_idx} has no positions.")
+            cumulative_overlap = torch.cumprod((1.0 - block_tv).clamp(0.0, 1.0), dim=0)
+            expected_accept_length = cumulative_overlap.sum()
+            expected_accept_lengths.append(expected_accept_length)
+            block_losses.append(1.0 - expected_accept_length / float(block_tv.numel()))
+        if not block_losses:
+            empty = tv_distances.new_empty((0,), dtype=torch.float32)
+            return empty, empty
+        return torch.stack(block_losses), torch.stack(expected_accept_lengths)
+
     def _run_dflash_draft_forward(
         self,
         *,
@@ -1111,6 +1452,195 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         draft_forward_ms = (time.perf_counter() - draft_start_time) * 1000.0
         return draft_hidden, attn_impl, draft_forward_ms
 
+    def _forward_opd_tv(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        prompt_lengths: torch.LongTensor,
+        response_lengths: torch.LongTensor,
+        reject_token_indices: torch.LongTensor,
+        target_hidden: torch.Tensor,
+        target_lm_hidden: torch.Tensor,
+        rejected_draft_anchor_indices: Optional[torch.LongTensor],
+        rejected_draft_offsets: Optional[torch.LongTensor],
+        rejected_draft_token_ids: Optional[torch.LongTensor],
+        rejected_draft_mask: Optional[torch.Tensor],
+        first_token_only: bool,
+        use_task_rewards: bool,
+        calculate_entropy: bool,
+        profile_enabled: bool,
+    ) -> dict[str, torch.Tensor]:
+        draft_block_size = self._get_block_size()
+        lm_head_chunk_size = self._get_lm_head_chunk_size()
+        (
+            anchor_positions,
+            segment_lens,
+            _,
+            block_keep_mask,
+            valid_seq_lens,
+            _,
+        ) = self._build_opd_anchor_plan(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+            reject_token_indices=reject_token_indices,
+            draft_block_size=draft_block_size,
+            # Exact TV is defined on every rollout speculative block. Sampling
+            # or striding anchors would change that objective.
+            response_anchor_stride=1,
+            random_response_anchor_enabled=False,
+            rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+            rejected_draft_offsets=rejected_draft_offsets,
+            rejected_draft_mask=rejected_draft_mask,
+            include_rejected_draft_anchors=True,
+        )
+        tv_plan = self._build_tv_position_plan(
+            prompt_lengths=prompt_lengths,
+            response_lengths=response_lengths,
+            anchor_positions=anchor_positions,
+            segment_lens=segment_lens,
+            block_keep_mask=block_keep_mask,
+            valid_seq_lens=valid_seq_lens,
+            draft_block_size=draft_block_size,
+            rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+            rejected_draft_offsets=rejected_draft_offsets,
+            rejected_draft_token_ids=rejected_draft_token_ids,
+            rejected_draft_mask=rejected_draft_mask,
+            first_token_only=first_token_only,
+        )
+        output_embeddings = self.get_output_embeddings()
+        if output_embeddings is None:
+            raise RuntimeError("Main model output embeddings are required for exact DFLASH TV.")
+
+        position_count = int(tv_plan["batch_indices"].numel())
+        block_count = int(tv_plan["block_count"])
+        if position_count == 0:
+            trainable_param = next((param for param in self.draft_model.parameters() if param.requires_grad), None)
+            if trainable_param is None:
+                raise RuntimeError("DFLASH TV requires at least one trainable draft parameter.")
+            zero_with_grad = trainable_param.flatten()[0].float() * 0.0
+            output = {
+                "dflash_tv_block_losses": zero_with_grad.reshape(1),
+                "dflash_tv_block_mask": torch.zeros((1,), dtype=torch.bool, device=input_ids.device),
+                "dflash_tv_distance_sum": zero_with_grad.detach(),
+                "dflash_tv_overlap_sum": zero_with_grad.detach(),
+                "dflash_tv_expected_accept_length_sum": zero_with_grad.detach(),
+                "dflash_tv_block_count": zero_with_grad.detach(),
+                "dflash_tv_position_count": zero_with_grad.detach(),
+                "dflash_tv_teacher_branch_position_count": zero_with_grad.detach(),
+            }
+            if use_task_rewards:
+                batch_size, seq_len = input_ids.shape
+                output["dflash_log_probs"] = target_hidden.new_zeros(
+                    (batch_size, seq_len), dtype=torch.float32
+                ) + zero_with_grad
+                output["dflash_loss_mask"] = target_hidden.new_zeros(
+                    (batch_size, seq_len), dtype=torch.float32
+                )
+                if calculate_entropy:
+                    output["dflash_entropy"] = target_hidden.new_zeros(
+                        (batch_size, seq_len), dtype=torch.float32
+                    )
+            return output
+
+        draft_hidden, _, _ = self._run_dflash_draft_forward(
+            input_ids=input_ids,
+            target_hidden=target_hidden,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            draft_block_size=draft_block_size,
+            profile_enabled=profile_enabled,
+            checkpoint_forward=True,
+        )
+        selected_draft_hidden = draft_hidden[tv_plan["batch_indices"], tv_plan["draft_indices"]]
+        selected_target_hidden, branch_position_count = self._compute_tv_teacher_branch_hidden(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            target_lm_hidden=target_lm_hidden,
+            tv_plan=tv_plan,
+        )
+        tv_distances = self._compute_full_vocab_tv_from_hidden(
+            draft_hidden=selected_draft_hidden,
+            target_hidden=selected_target_hidden,
+            output_embeddings=output_embeddings,
+            chunk_size=lm_head_chunk_size,
+        )
+        block_losses, expected_accept_lengths = self._compute_e2e_tv_block_outputs(
+            tv_distances=tv_distances,
+            block_indices=tv_plan["block_indices"],
+            block_count=block_count,
+        )
+        output = {
+            "dflash_tv_block_losses": block_losses,
+            "dflash_tv_block_mask": torch.ones_like(block_losses, dtype=torch.bool),
+            "dflash_tv_distance_sum": tv_distances.detach().sum(),
+            "dflash_tv_overlap_sum": (1.0 - tv_distances.detach()).sum(),
+            "dflash_tv_expected_accept_length_sum": expected_accept_lengths.detach().sum(),
+            "dflash_tv_block_count": block_losses.new_tensor(float(block_count)).detach(),
+            "dflash_tv_position_count": block_losses.new_tensor(float(position_count)).detach(),
+            "dflash_tv_teacher_branch_position_count": block_losses.new_tensor(
+                float(branch_position_count)
+            ).detach(),
+        }
+        if use_task_rewards:
+            batch_size, seq_len = input_ids.shape
+            log_probs_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+            loss_mask_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+            entropy_by_seq = (
+                target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+                if calculate_entropy
+                else None
+            )
+            response_batch_indices: list[torch.Tensor] = []
+            response_draft_indices: list[torch.Tensor] = []
+            response_row_indices: list[torch.Tensor] = []
+            response_labels: list[torch.Tensor] = []
+            for block_offset in range(1, draft_block_size):
+                active_blocks = block_keep_mask & (segment_lens >= block_offset)
+                if not bool(active_blocks.any()):
+                    continue
+                active_indices = torch.nonzero(active_blocks, as_tuple=False)
+                batch_indices = active_indices[:, 0]
+                block_indices = active_indices[:, 1]
+                row_indices = anchor_positions[batch_indices, block_indices] + block_offset - 1
+                label_indices = row_indices + 1
+                in_bounds = label_indices < valid_seq_lens[batch_indices]
+                if not bool(in_bounds.any()):
+                    continue
+                batch_indices = batch_indices[in_bounds]
+                block_indices = block_indices[in_bounds]
+                row_indices = row_indices[in_bounds]
+                response_batch_indices.append(batch_indices)
+                response_draft_indices.append(block_indices * draft_block_size + block_offset)
+                response_row_indices.append(row_indices)
+                response_labels.append(input_ids[batch_indices, row_indices + 1])
+            if response_batch_indices:
+                batch_tensor = torch.cat(response_batch_indices)
+                draft_tensor = torch.cat(response_draft_indices)
+                row_tensor = torch.cat(response_row_indices)
+                label_tensor = torch.cat(response_labels)
+                selected_log_probs, selected_entropy = self._compute_selected_lm_log_probs(
+                    draft_hidden=draft_hidden,
+                    output_embeddings=output_embeddings,
+                    batch_indices=batch_tensor,
+                    draft_indices=draft_tensor,
+                    token_ids=label_tensor,
+                    chunk_size=lm_head_chunk_size,
+                    calculate_entropy=calculate_entropy,
+                )
+                log_probs_by_seq[batch_tensor, row_tensor] = selected_log_probs
+                loss_mask_by_seq[batch_tensor, row_tensor] = 1.0
+                if entropy_by_seq is not None and selected_entropy is not None:
+                    entropy_by_seq[batch_tensor, row_tensor] = selected_entropy
+            output["dflash_log_probs"] = log_probs_by_seq
+            output["dflash_loss_mask"] = loss_mask_by_seq
+            if entropy_by_seq is not None:
+                output["dflash_entropy"] = entropy_by_seq
+        return output
+
     def _forward_opd(
         self,
         *,
@@ -1125,6 +1655,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_token_ids: Optional[torch.LongTensor] = None,
         rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         rejected_draft_mask: Optional[torch.Tensor] = None,
+        use_tv_loss: bool = False,
+        rejected_draft_first_token_only: bool = False,
+        use_task_rewards: bool = False,
         calculate_entropy: bool = False,
         use_replay_dis: bool = False,
         replay_block_anchor_indices: Optional[torch.LongTensor] = None,
@@ -1152,6 +1685,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         target_kwargs.pop("dflash_rejected_draft_token_ids", None)
         target_kwargs.pop("dflash_rejected_draft_teacher_logprobs", None)
         target_kwargs.pop("dflash_rejected_draft_mask", None)
+        target_kwargs.pop("dflash_use_tv_loss", None)
+        target_kwargs.pop("dflash_rejected_draft_first_token_only", None)
+        target_kwargs.pop("dflash_use_task_rewards", None)
         target_kwargs.pop("dflash_calculate_entropy", None)
         target_kwargs.pop("dflash_use_replay_dis", None)
         target_kwargs.pop("dflash_replay_block_anchor_indices", None)
@@ -1176,6 +1712,26 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             target_hidden = self._extract_target_hidden(teacher_outputs.hidden_states)
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
         teacher_forward_ms = (time.perf_counter() - teacher_start_time) * 1000.0
+
+        if use_tv_loss:
+            return self._forward_opd_tv(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                prompt_lengths=prompt_lengths,
+                response_lengths=response_lengths,
+                reject_token_indices=reject_token_indices,
+                target_hidden=target_hidden,
+                target_lm_hidden=target_lm_hidden,
+                rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                rejected_draft_offsets=rejected_draft_offsets,
+                rejected_draft_token_ids=rejected_draft_token_ids,
+                rejected_draft_mask=rejected_draft_mask,
+                first_token_only=rejected_draft_first_token_only,
+                use_task_rewards=use_task_rewards,
+                calculate_entropy=calculate_entropy,
+                profile_enabled=profile_enabled,
+            )
 
         # SGLang DFLASH uses block_size as the total block length: one anchor
         # token plus block_size - 1 future-token predictions.
@@ -1488,6 +2044,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         dflash_rejected_draft_token_ids: Optional[torch.LongTensor] = None,
         dflash_rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         dflash_rejected_draft_mask: Optional[torch.Tensor] = None,
+        dflash_use_tv_loss: bool = False,
+        dflash_rejected_draft_first_token_only: bool = False,
+        dflash_use_task_rewards: bool = False,
         dflash_calculate_entropy: bool = False,
         dflash_use_replay_dis: bool = False,
         dflash_replay_block_anchor_indices: Optional[torch.LongTensor] = None,
@@ -1516,6 +2075,9 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 rejected_draft_token_ids=dflash_rejected_draft_token_ids,
                 rejected_draft_teacher_logprobs=dflash_rejected_draft_teacher_logprobs,
                 rejected_draft_mask=dflash_rejected_draft_mask,
+                use_tv_loss=bool(dflash_use_tv_loss),
+                rejected_draft_first_token_only=bool(dflash_rejected_draft_first_token_only),
+                use_task_rewards=bool(dflash_use_task_rewards),
                 calculate_entropy=bool(dflash_calculate_entropy),
                 use_replay_dis=bool(dflash_use_replay_dis),
                 replay_block_anchor_indices=dflash_replay_block_anchor_indices,
