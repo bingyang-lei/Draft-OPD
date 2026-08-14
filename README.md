@@ -22,6 +22,7 @@
 
 ## News
 
+- [August 2026] **E2E TV loss with first-reject-only achieves stronger performance.** See the [`feature/dflash-tv-loss`](https://github.com/Simplified-Reasoning/Draft-OPD/tree/feature/dflash-tv-loss) branch, [training script](https://github.com/Simplified-Reasoning/Draft-OPD/blob/feature/dflash-tv-loss/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-8b-local.sh), and [released checkpoint](https://huggingface.co/bingyang-lei/qwen3-8b-thinking-dflash-draftopd-tvloss).
 - [August 2026] An experimental vLLM / vLLM-Ascend rollout path is available on the [`dev_vllm`](https://github.com/Simplified-Reasoning/Draft-OPD/tree/dev_vllm). Thanks [@curnane-lab](https://github.com/curnane-lab)!
 - [July 2026] The training data for Draft-OPD has been released and is available at `/data`.
 - [May 2026] Draft-OPD is available on arXiv: [2605.29343](https://arxiv.org/abs/2605.29343).
