@@ -13,13 +13,13 @@ cd "${REPO_ROOT}"
 
 # /mnt/shared-storage-user/leihaodi/imo/SpecForge/outputs/qwen3-8b-dflash/epoch_5_step_280000
 # /mnt/shared-storage-user/leihaodi/imo/SpecForge/outputs/qwen3-4b-dflash_data/epoch_5_step_295000
-ACTOR_DIR_TEMPLATE=${ACTOR_DIR_TEMPLATE:-"/mnt/shared-storage-user/leihaodi/opd/verl/checkpoints/verl-dflash-opd/exp-qwen3-8b-tvloss/reject-first-token-no-decay_True/{step_name}/actor"} # your FSDP actor checkpoint template.
-REFERENCE_DRAFT_DIR=${REFERENCE_DRAFT_DIR:-"/mnt/shared-storage-user/leihaodi/imo/SpecForge/outputs/qwen3-8b-dflash/epoch_5_step_280000"} # your reference DFlash draft model path.
-TARGET_DIR_TEMPLATE=${TARGET_DIR_TEMPLATE:-"/mnt/shared-storage-user/leihaodi/opd/verl/checkpoints/verl-dflash-opd/exp-qwen3-8b-tvloss/reject-first-token-no-decay_True/{step_name}/draft"} # your output draft model template.
+ACTOR_DIR_TEMPLATE=${ACTOR_DIR_TEMPLATE:-"/mnt/shared-storage-user/leihaodi/opd/verl/checkpoints/verl-dflash-opd/exp-qwen3-4b/reject-first_True/{step_name}/actor"} # your FSDP actor checkpoint template.
+REFERENCE_DRAFT_DIR=${REFERENCE_DRAFT_DIR:-"/mnt/shared-storage-user/leihaodi/imo/SpecForge/outputs/qwen3-4b-dflash_data/epoch_5_step_295000"} # your reference DFlash draft model path.
+TARGET_DIR_TEMPLATE=${TARGET_DIR_TEMPLATE:-"/mnt/shared-storage-user/leihaodi/opd/verl/checkpoints/verl-dflash-opd/exp-qwen3-4b/reject-first_True/{step_name}/draft"} # your output draft model template.
 
 # Space-separated checkpoint step names, for example:
 #   STEP_NAMES="global_step_5000 global_step_5500"
-STEP_NAMES=${STEP_NAMES:-"global_step_5500 global_step_6000 global_step_6500 global_step_7000"} # global_step_17500 global_step_20000 global_step_21216
+STEP_NAMES=${STEP_NAMES:-"global_step_4500 global_step_5000 global_step_5304"} # global_step_17500 global_step_20000 global_step_21216
 
 if [[ -z "${STEP_NAMES}" || -z "${ACTOR_DIR_TEMPLATE}" || -z "${REFERENCE_DRAFT_DIR}" || -z "${TARGET_DIR_TEMPLATE}" ]]; then
   cat >&2 <<'EOF'

@@ -12,3 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .losses import *  # noqa: F401, E402
+from .teacher_source import (  # noqa: F401
+    TEACHER_LOGPROB_SOURCE_COMPOSED_MAIN,
+    requires_external_teacher,
+    resolve_teacher_logprob_source,
+)

@@ -1664,6 +1664,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         use_replay_dis = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_replay_dis", default=False))
         use_tv_loss = bool(tu.get_non_tensor_data(data=micro_batch, key="opd_use_tv_loss", default=False))
+        use_composed_teacher_logprobs = bool(
+            tu.get_non_tensor_data(data=micro_batch, key="opd_use_composed_teacher_logprobs", default=False)
+        )
         model_inputs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -1681,6 +1684,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             ),
             "dflash_use_replay_dis": use_replay_dis,
             "dflash_use_tv_loss": use_tv_loss,
+            "dflash_use_composed_teacher_logprobs": use_composed_teacher_logprobs,
             "dflash_rejected_draft_first_token_only": bool(
                 tu.get_non_tensor_data(
                     data=micro_batch, key="opd_rejected_draft_first_token_only", default=False
@@ -1918,6 +1922,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = output.get("dflash_log_probs")
                 dflash_entropy = output.get("dflash_entropy")
                 dflash_loss_mask = output.get("dflash_loss_mask")
+                dflash_teacher_log_probs = output.get("dflash_teacher_log_probs")
                 dflash_response_offsets = output.get("dflash_response_offsets")
                 dflash_rejected_draft_student_log_probs = output.get("dflash_rejected_draft_student_log_probs")
                 dflash_rejected_draft_teacher_log_probs = output.get("dflash_rejected_draft_teacher_log_probs")
@@ -1929,6 +1934,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 dflash_log_probs = getattr(output, "dflash_log_probs", None)
                 dflash_entropy = getattr(output, "dflash_entropy", None)
                 dflash_loss_mask = getattr(output, "dflash_loss_mask", None)
+                dflash_teacher_log_probs = getattr(output, "dflash_teacher_log_probs", None)
                 dflash_response_offsets = getattr(output, "dflash_response_offsets", None)
                 dflash_rejected_draft_student_log_probs = getattr(
                     output, "dflash_rejected_draft_student_log_probs", None
@@ -1965,6 +1971,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "log_probs": format_dflash_sequence_output(dflash_log_probs),
                 "opd_loss_mask": format_dflash_sequence_output(dflash_loss_mask),
             }
+            if dflash_teacher_log_probs is not None:
+                model_output["opd_teacher_log_probs"] = format_dflash_sequence_output(dflash_teacher_log_probs)
             if dflash_response_offsets is not None:
                 model_output["opd_response_offsets"] = format_dflash_sequence_output(dflash_response_offsets)
             if eagle3_native_ce_losses is not None:

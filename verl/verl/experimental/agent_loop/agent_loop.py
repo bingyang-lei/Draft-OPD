@@ -37,7 +37,7 @@ from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_enabled, requires_external_teacher
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -515,11 +515,13 @@ class AgentLoopWorker:
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
+        self.use_external_teacher = requires_external_teacher(config)
         if self.distillation_enabled:
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.distillation_config)
             self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
             self.teacher_key: str = self.distillation_config.teacher_key
 
+        if self.use_external_teacher:
             if not teacher_servers:
                 raise ValueError("Distillation is enabled but no teacher servers were provided.")
             if not teacher_load_balancer_handle:
@@ -1124,7 +1126,7 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
-        if self.distillation_enabled and not validate:
+        if self.use_external_teacher and not validate:
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -1286,6 +1288,7 @@ class AgentLoopManager:
 
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
+        self.use_external_teacher = requires_external_teacher(self.config)
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -1370,7 +1373,7 @@ class AgentLoopManager:
         load_balancer_handle = self.global_load_balancer
         servers = list(zip(self.server_addresses, self.server_handles, strict=True))
 
-        if self.distillation_enabled:
+        if self.use_external_teacher:
             # teacher_model_manager exposes per-teacher dicts keyed by teacher key.
             teacher_servers = {
                 key: list(

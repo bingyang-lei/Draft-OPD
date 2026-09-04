@@ -1,8 +1,10 @@
+import asyncio
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 from transformers import PretrainedConfig
 
@@ -10,6 +12,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopW
 from verl.models.transformers.dflash_student import ComposedDFlashStudentForCausalLM, full_vocab_tv_distance
 from verl.models.transformers.eagle3_student import ComposedEagle3StudentForCausalLM, Eagle3DraftModel
 from verl.protocol import DataProto
+from verl.trainer.distillation import requires_external_teacher, resolve_teacher_logprob_source
 from verl.trainer.distillation.losses import (
     distillation_loss,
     get_effective_distillation_response_mask,
@@ -17,7 +20,7 @@ from verl.trainer.distillation.losses import (
 )
 from verl.trainer.ppo.core_algos import kl_penalty
 from verl.utils import tensordict_utils as tu
-from verl.workers.config import DistillationLossConfig
+from verl.workers.config import DistillationConfig, DistillationLossConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.rollout.sglang_rollout.utils import align_dflash_reject_token_mask
 
@@ -41,6 +44,118 @@ def _local_forward_kl(student_log_probs, teacher_log_probs):
     return teacher_probs * (teacher_log_probs - student_log_probs) + (1.0 - teacher_probs) * (
         torch.log1p(-teacher_probs) - torch.log1p(-student_probs)
     )
+
+
+def _teacher_source_config(
+    *,
+    teacher_path="/models/main",
+    composed=True,
+    source="auto",
+    use_tv_loss=False,
+    use_policy_gradient=False,
+    loss_mode="k3",
+):
+    return OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "model": {
+                    "path": "/models/main",
+                    "override_config": {
+                        "verl_composed_dflash_student": composed,
+                        "verl_dflash_main_model_path": "/models/main",
+                    },
+                }
+            },
+            "distillation": {
+                "enabled": True,
+                "teacher_logprob_source": source,
+                "teacher_models": {"teacher_model": {"model_path": teacher_path}},
+                "distillation_loss": {
+                    "loss_mode": loss_mode,
+                    "use_tv_loss": use_tv_loss,
+                    "use_policy_gradient": use_policy_gradient,
+                },
+            },
+        }
+    )
+
+
+def test_teacher_source_auto_uses_composed_main_only_for_matching_dflash_teacher():
+    config = _teacher_source_config()
+
+    assert resolve_teacher_logprob_source(config) == "composed_main"
+    assert config.distillation.teacher_logprob_source == "composed_main"
+    assert not requires_external_teacher(config)
+
+    different_teacher = _teacher_source_config(teacher_path="/models/different")
+    assert resolve_teacher_logprob_source(different_teacher) == "server"
+    assert requires_external_teacher(different_teacher)
+
+    non_composed = _teacher_source_config(composed=False)
+    assert resolve_teacher_logprob_source(non_composed) == "server"
+    assert requires_external_teacher(non_composed)
+
+
+def test_composed_main_teacher_source_rejects_unsupported_training_modes():
+    with pytest.raises(NotImplementedError, match="direct supervised"):
+        resolve_teacher_logprob_source(_teacher_source_config(use_policy_gradient=True))
+
+    with pytest.raises(NotImplementedError, match="scalar sampled"):
+        resolve_teacher_logprob_source(_teacher_source_config(loss_mode="forward_kl_topk"))
+
+    config = DistillationConfig(
+        enabled=True,
+        teacher_logprob_source="composed_main",
+        distillation_loss=DistillationLossConfig(use_policy_gradient=False, loss_mode="k3"),
+    )
+    assert config.teacher_models == {}
+
+
+def test_agent_loop_skips_post_rollout_teacher_scoring_for_composed_main():
+    worker = object.__new__(AgentLoopWorker)
+    worker.use_external_teacher = False
+    output = SimpleNamespace(extra_fields={})
+
+    asyncio.run(
+        worker._compute_teacher_logprobs(
+            output,
+            prompt_ids=[1, 2],
+            response_ids=[3, 4],
+            validate=False,
+        )
+    )
+
+    assert output.extra_fields == {}
+
+
+def test_composed_main_hidden_forward_skips_causal_lm_head():
+    class _Decoder:
+        def __init__(self):
+            self.call_count = 0
+
+        def __call__(self, **kwargs):
+            self.call_count += 1
+            return SimpleNamespace(hidden_states=(kwargs["input_ids"].float().unsqueeze(-1),))
+
+    class _CausalLM:
+        def __init__(self):
+            self.decoder = _Decoder()
+            self.call_count = 0
+
+        def get_decoder(self):
+            return self.decoder
+
+        def __call__(self, **kwargs):
+            self.call_count += 1
+            raise AssertionError("The trajectory-wide CausalLM head must not run.")
+
+    student = object.__new__(ComposedDFlashStudentForCausalLM)
+    student.main_model = _CausalLM()
+    output = student._forward_main_hidden_only(input_ids=torch.tensor([[1, 2]]), output_hidden_states=True)
+
+    assert output.hidden_states[-1].tolist() == [[[1.0], [2.0]]]
+    assert student.main_model.decoder.call_count == 1
+    assert student.main_model.call_count == 0
 
 
 class _CaseLogTokenizer:
@@ -144,7 +259,11 @@ def test_prepare_composed_dflash_inputs_preserves_true_lengths_after_no_padding(
         },
         batch_size=[2],
     )
-    tu.assign_non_tensor(batch, dflash_reject_token_indices=[[1], [2]])
+    tu.assign_non_tensor(
+        batch,
+        dflash_reject_token_indices=[[1], [2]],
+        opd_use_composed_teacher_logprobs=True,
+    )
     tu.assign_non_tensor(
         batch,
         dflash_rejected_draft_anchor_indices=[[0, 1], []],
@@ -175,6 +294,7 @@ def test_prepare_composed_dflash_inputs_preserves_true_lengths_after_no_padding(
         torch.tensor([[-0.1, -0.2], [0.0, 0.0]], dtype=torch.float32),
     )
     assert model_inputs["dflash_rejected_draft_mask"].tolist() == [[True, True], [False, False]]
+    assert model_inputs["dflash_use_composed_teacher_logprobs"] is True
 
 
 def test_dflash_anchor_plan_skips_empty_rejects_and_uses_block_size_as_total_length():
@@ -540,6 +660,7 @@ def test_eagle3_target_to_draft_mapping_masks_unsupported_tokens():
     draft_model.refresh_target_to_draft()
 
     student = object.__new__(ComposedEagle3StudentForCausalLM)
+    torch.nn.Module.__init__(student)
     student.draft_model = draft_model
 
     draft_ids, supported = student._map_target_to_draft_ids(torch.tensor([0, 3, 6, 5, 11]))
@@ -696,6 +817,41 @@ def test_effective_distillation_response_mask_applies_opd_loss_mask():
 
     effective_mask = get_effective_distillation_response_mask(data=data, model_output=model_output)
     assert effective_mask.tolist() == [[True, True, False, False]]
+
+
+def test_scalar_distillation_uses_composed_main_logprobs_without_rollout_teacher_output():
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1]], dtype=torch.long),
+            "responses": torch.tensor([[2, 3]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        },
+        batch_size=[1],
+    )
+    model_output = {
+        "log_probs": torch.tensor([-0.4, -0.9, 0.0], dtype=torch.float32),
+        "opd_teacher_log_probs": torch.tensor([-0.5, -0.7, 0.0], dtype=torch.float32),
+        "opd_loss_mask": torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32),
+    }
+    config = SimpleNamespace(loss_agg_mode="token-mean", global_batch_info={})
+    loss_config = SimpleNamespace(
+        loss_mode="k3",
+        loss_max_clamp=None,
+        use_policy_gradient=False,
+        response_stream_weight=1.0,
+        rejected_draft_stream_weight=0.0,
+    )
+
+    loss, _ = distillation_loss(
+        config,
+        SimpleNamespace(distillation_loss=loss_config),
+        model_output,
+        data,
+    )
+
+    expected = kl_penalty(torch.tensor([-0.4, -0.9]), torch.tensor([-0.5, -0.7]), "k3").mean()
+    assert torch.allclose(loss, expected)
 
 
 def test_combined_k3_loss_includes_rejected_draft_tokens():

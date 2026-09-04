@@ -15,14 +15,14 @@
 /install-local.sh
 /.nested-git-backups/
 
-# In the OPD trainer examples, publish only the two reusable entrypoints.
+# In the OPD trainer examples, publish only the selected reusable entrypoints.
 /verl/examples/on_policy_distillation_trainer/*
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k.sh
 !/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh
-!/verl/examples/on_policy_distillation_trainer/run_qwen-30b-a3b.sh
+!/verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-8b-local.sh
+!/verl/examples/on_policy_distillation_trainer/run_qwen_eagle3.sh
+
+
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md
 /verl/my-purpose.md
-/verl/scripts/fsdp_to_eagle3.sh
-/verl/scripts/extract_eagle3_draft_from_fsdp.py
-/verl/verl/models/transformers/eagle3_student.py

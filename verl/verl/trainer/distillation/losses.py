@@ -1026,7 +1026,16 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    composed_teacher_log_probs = model_output.get("opd_teacher_log_probs")
+    if composed_teacher_log_probs is not None:
+        teacher_log_probs = no_padding_2_padding(composed_teacher_log_probs, data)
+    elif "teacher_logprobs" in data:
+        teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    else:
+        raise RuntimeError(
+            "Scalar distillation requires either model_output['opd_teacher_log_probs'] "
+            "or data['teacher_logprobs']."
+        )
     response_mask_bool = get_effective_distillation_response_mask(data=data, model_output=model_output)
     assert teacher_log_probs.shape == student_log_probs.shape == response_mask_bool.shape
 

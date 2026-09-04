@@ -63,7 +63,11 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import (
+    is_distillation_enabled,
+    requires_external_teacher,
+    resolve_teacher_logprob_source,
+)
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
@@ -691,15 +695,19 @@ class PPOTrainer:
         logger.info("reward loop manager initialized")
 
         # 8. initialize teacher loop manager
-        if self.use_teacher_policy:
+        self.use_external_teacher = requires_external_teacher(self.config)
+        if self.use_external_teacher:
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
+
+        if self.use_teacher_policy:
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
             self.distillation_config = None
 
         # 9. initialize agent loop manager
@@ -1418,6 +1426,10 @@ class PPOTrainer:
             "opd_use_tv_loss": bool(
                 getattr(self.distillation_config.distillation_loss, "use_tv_loss", False)
             ),
+            "opd_use_composed_teacher_logprobs": (
+                self.distillation_config.teacher_logprob_source == "composed_main"
+                and not bool(getattr(self.distillation_config.distillation_loss, "use_tv_loss", False))
+            ),
             "opd_rejected_draft_first_token_only": bool(
                 getattr(self.distillation_config.distillation_loss, "rejected_draft_first_token_only", False)
             ),
@@ -1682,7 +1694,7 @@ class TaskRunner:
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if requires_external_teacher(config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -1695,8 +1707,9 @@ class TaskRunner:
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def run(self, config):
-        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        resolve_teacher_logprob_source(config)
+        pprint(OmegaConf.to_container(config, resolve=True))
 
         # initialize transfer queue
         tq.init(config.transfer_queue)

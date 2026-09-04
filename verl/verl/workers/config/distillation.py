@@ -275,6 +275,10 @@ class DistillationConfig(BaseConfig):
 
     enabled (bool):
         Whether on-policy distillation is enabled.
+    teacher_logprob_source (str):
+        Source for response-token teacher log probabilities. ``server`` keeps the external teacher service;
+        ``composed_main`` reuses a compatible composed DFLASH student's frozen main model. Launch configs may use
+        ``auto`` and resolve it before resource construction.
     n_gpus_per_node (int):
         Number of GPUs per node in the teacher resource pool.
     nnodes (int):
@@ -308,9 +312,15 @@ class DistillationConfig(BaseConfig):
     ```
     """
 
-    _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
+    _mutable_fields = BaseConfig._mutable_fields | {
+        "teacher_models",
+        "n_gpus_per_node",
+        "nnodes",
+        "teacher_logprob_source",
+    }
 
     enabled: bool = False
+    teacher_logprob_source: str = "server"
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -319,6 +329,24 @@ class DistillationConfig(BaseConfig):
 
     def __post_init__(self):
         if not self.enabled:
+            return
+
+        if self.teacher_logprob_source not in {"auto", "server", "composed_main"}:
+            raise ValueError(
+                f"Unsupported teacher_logprob_source={self.teacher_logprob_source!r}; "
+                "expected one of ['auto', 'composed_main', 'server']."
+            )
+        if self.teacher_logprob_source == "composed_main":
+            if self.distillation_loss.use_policy_gradient:
+                raise NotImplementedError(
+                    "Composed-main teacher scoring only supports direct supervised distillation "
+                    "(use_policy_gradient=False)."
+                )
+            if not self.distillation_loss.use_tv_loss and self.distillation_loss.loss_settings.use_topk:
+                raise NotImplementedError(
+                    "Composed-main teacher scoring does not support top-k distillation losses."
+                )
+            self.teacher_models = {}
             return
 
         self.teacher_models = self._resolve_teacher_models()

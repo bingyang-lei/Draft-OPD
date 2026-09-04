@@ -279,6 +279,27 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, value):
         self.main_model.set_output_embeddings(value)
 
+    def _forward_main_hidden_only(self, **kwargs):
+        """Run the frozen main decoder without materializing trajectory-wide LM logits."""
+        hidden_model = None
+        get_decoder = getattr(self.main_model, "get_decoder", None)
+        if callable(get_decoder):
+            candidate = get_decoder()
+            if candidate is not self.main_model:
+                hidden_model = candidate
+        if hidden_model is None:
+            base_model_prefix = getattr(self.main_model, "base_model_prefix", None)
+            if base_model_prefix:
+                candidate = getattr(self.main_model, str(base_model_prefix), None)
+                if candidate is not None and candidate is not self.main_model:
+                    hidden_model = candidate
+        # Lightweight test doubles and remote-code models may expose only a
+        # CausalLM-style callable. Keep them functional, while standard Qwen
+        # uses get_decoder() above and therefore skips the full LM head.
+        if hidden_model is None:
+            hidden_model = self.main_model
+        return hidden_model(**kwargs)
+
     def _extract_target_hidden(self, hidden_states: tuple[torch.Tensor, ...]) -> torch.Tensor:
         selected_states = []
         for layer_id in self.target_layer_ids:
@@ -1258,7 +1279,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     branch_input_ids.shape[1], dtype=position_ids.dtype, device=position_ids.device
                 ).unsqueeze(0)
             with torch.no_grad():
-                branch_outputs = self.main_model(
+                branch_outputs = self._forward_main_hidden_only(
                     input_ids=branch_input_ids,
                     attention_mask=branch_attention_mask,
                     position_ids=branch_position_ids,
@@ -1656,6 +1677,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         rejected_draft_mask: Optional[torch.Tensor] = None,
         use_tv_loss: bool = False,
+        use_composed_teacher_logprobs: bool = False,
         rejected_draft_first_token_only: bool = False,
         use_task_rewards: bool = False,
         calculate_entropy: bool = False,
@@ -1686,6 +1708,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         target_kwargs.pop("dflash_rejected_draft_teacher_logprobs", None)
         target_kwargs.pop("dflash_rejected_draft_mask", None)
         target_kwargs.pop("dflash_use_tv_loss", None)
+        target_kwargs.pop("dflash_use_composed_teacher_logprobs", None)
         target_kwargs.pop("dflash_rejected_draft_first_token_only", None)
         target_kwargs.pop("dflash_use_task_rewards", None)
         target_kwargs.pop("dflash_calculate_entropy", None)
@@ -1697,7 +1720,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
 
         teacher_start_time = time.perf_counter()
         with torch.no_grad():
-            teacher_outputs = self.main_model(
+            teacher_outputs = self._forward_main_hidden_only(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1811,6 +1834,11 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
 
         lm_head_start_time = time.perf_counter()
         log_probs_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+        teacher_log_probs_by_seq = (
+            target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
+            if use_composed_teacher_logprobs
+            else None
+        )
         loss_mask_by_seq = target_hidden.new_zeros((batch_size, seq_len), dtype=torch.float32)
         response_offsets_by_seq = torch.zeros((batch_size, seq_len), dtype=torch.long, device=input_ids.device)
         entropy_by_seq = (
@@ -1884,6 +1912,20 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     calculate_entropy=calculate_entropy,
                 )
                 log_probs_by_seq[response_batch_tensor, response_row_tensor] = selected_log_probs
+                if teacher_log_probs_by_seq is not None:
+                    with torch.no_grad():
+                        selected_teacher_log_probs, _ = self._compute_selected_lm_log_probs(
+                            draft_hidden=target_lm_hidden,
+                            output_embeddings=output_embeddings,
+                            batch_indices=response_batch_tensor,
+                            draft_indices=response_row_tensor,
+                            token_ids=response_label_tensor,
+                            chunk_size=lm_head_chunk_size,
+                            calculate_entropy=False,
+                        )
+                    teacher_log_probs_by_seq[response_batch_tensor, response_row_tensor] = (
+                        selected_teacher_log_probs.detach()
+                    )
                 loss_mask_by_seq[response_batch_tensor, response_row_tensor] = 1.0
                 response_offsets_by_seq[response_batch_tensor, response_row_tensor] = response_offset_tensor
                 if entropy_by_seq is not None and selected_entropy is not None:
@@ -2005,6 +2047,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         if entropy_by_seq is not None:
             output["dflash_entropy"] = entropy_by_seq
+        if teacher_log_probs_by_seq is not None:
+            output["dflash_teacher_log_probs"] = teacher_log_probs_by_seq
         if use_replay_dis:
             output.update(
                 self._compute_replay_dis_mismatch(
@@ -2045,6 +2089,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         dflash_rejected_draft_teacher_logprobs: Optional[torch.Tensor] = None,
         dflash_rejected_draft_mask: Optional[torch.Tensor] = None,
         dflash_use_tv_loss: bool = False,
+        dflash_use_composed_teacher_logprobs: bool = False,
         dflash_rejected_draft_first_token_only: bool = False,
         dflash_use_task_rewards: bool = False,
         dflash_calculate_entropy: bool = False,
@@ -2076,6 +2121,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 rejected_draft_teacher_logprobs=dflash_rejected_draft_teacher_logprobs,
                 rejected_draft_mask=dflash_rejected_draft_mask,
                 use_tv_loss=bool(dflash_use_tv_loss),
+                use_composed_teacher_logprobs=bool(dflash_use_composed_teacher_logprobs),
                 rejected_draft_first_token_only=bool(dflash_rejected_draft_first_token_only),
                 use_task_rewards=bool(dflash_use_task_rewards),
                 calculate_entropy=bool(dflash_calculate_entropy),

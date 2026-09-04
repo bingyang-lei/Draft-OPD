@@ -13,6 +13,10 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Teacher scoring source. `auto` uses the frozen main model for a compatible
+# composed DFLASH student and otherwise keeps the external teacher server.
+teacher_logprob_source: auto
+
 # distillation loss config
 distillation_loss:
 

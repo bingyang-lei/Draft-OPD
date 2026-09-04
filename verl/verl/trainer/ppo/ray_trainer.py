@@ -41,6 +41,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation import requires_external_teacher
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -306,6 +307,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
+        self.use_external_teacher = requires_external_teacher(self.config)
 
         self.use_rm = need_reward_model(self.config)
 
@@ -1015,7 +1017,7 @@ class RayPPOTrainer:
         self.async_rollout_mode = True
 
         # initialize teacher loop manager
-        if self.use_teacher_policy:
+        if self.use_external_teacher:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
@@ -1023,9 +1025,12 @@ class RayPPOTrainer:
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
         else:
             self.teacher_model_manager = None
+
+        if self.use_teacher_policy:
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
             self.distillation_config = None
 
         # Support custom AgentLoopManager via config
@@ -1436,6 +1441,7 @@ class RayPPOTrainer:
         rejected_draft_first_token_only = False
         use_tv_loss = False
         use_task_rewards = False
+        use_composed_teacher_logprobs = False
         if is_distillation_enabled(self.config.get("distillation")) and self.distillation_config is not None:
             loss_config = self.distillation_config.distillation_loss
             rejected_draft_position_decay_enabled = bool(
@@ -1445,6 +1451,9 @@ class RayPPOTrainer:
             rejected_draft_first_token_only = bool(getattr(loss_config, "rejected_draft_first_token_only", False))
             use_tv_loss = bool(getattr(loss_config, "use_tv_loss", False))
             use_task_rewards = bool(getattr(loss_config, "use_task_rewards", False))
+            use_composed_teacher_logprobs = (
+                self.distillation_config.teacher_logprob_source == "composed_main" and not use_tv_loss
+            )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         if effective_mini_batch_size is not None:
@@ -1465,6 +1474,7 @@ class RayPPOTrainer:
             opd_rejected_draft_position_decay=rejected_draft_position_decay,
             opd_rejected_draft_first_token_only=rejected_draft_first_token_only,
             opd_use_tv_loss=use_tv_loss,
+            opd_use_composed_teacher_logprobs=use_composed_teacher_logprobs,
             opd_use_task_rewards=use_task_rewards,
             compute_loss=True,
         )
